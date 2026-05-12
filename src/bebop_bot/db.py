@@ -1,6 +1,8 @@
+import json
 import logging
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import aiosqlite
 
@@ -197,3 +199,111 @@ async def count_rows(conn: aiosqlite.Connection, table: str) -> int:
 async def fetch_all(conn: aiosqlite.Connection, sql: str, params: Iterable = ()) -> list[aiosqlite.Row]:
     async with conn.execute(sql, tuple(params)) as cur:
         return list(await cur.fetchall())
+
+
+@dataclass(frozen=True, slots=True)
+class TopicRow:
+    name: str
+    query: str
+    last_seen_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackRow:
+    tweet_id: str
+    author_handle: str
+    label: str
+    tweet_text: str
+
+
+class Db:
+    """Thin async wrapper exposing the operations pipeline code needs.
+
+    Holds a reference to an open aiosqlite connection. Existing handlers may
+    keep using the raw connection; this class is the surface the pipeline,
+    filter, and new commands use.
+    """
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self.conn = conn
+
+    async def get_setting(self, key: str, default: str | None = None) -> str | None:
+        return await get_setting(self.conn, key, default)
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await set_setting(self.conn, key, value)
+
+    async def is_paused(self) -> bool:
+        return (await self.get_setting("paused", "0")) == "1"
+
+    async def get_topics(self) -> list[TopicRow]:
+        rows = await fetch_all(
+            self.conn,
+            "SELECT name, query, last_seen_id FROM topics ORDER BY name",
+        )
+        return [TopicRow(r["name"], r["query"], r["last_seen_id"]) for r in rows]
+
+    async def update_topic_since_id(self, name: str, since_id: str) -> None:
+        await self.conn.execute(
+            "UPDATE topics SET last_seen_id = ? WHERE name = ?",
+            (since_id, name),
+        )
+        await self.conn.commit()
+
+    async def get_allowlist(self) -> set[str]:
+        rows = await fetch_all(self.conn, "SELECT handle FROM allowlist")
+        return {r["handle"].lower() for r in rows}
+
+    async def get_recent_feedback(self, label: str, limit: int) -> list[FeedbackRow]:
+        rows = await fetch_all(
+            self.conn,
+            "SELECT tweet_id, author_handle, label, tweet_text FROM feedback "
+            "WHERE label = ? ORDER BY created_at DESC LIMIT ?",
+            (label, int(limit)),
+        )
+        return [
+            FeedbackRow(r["tweet_id"], r["author_handle"], r["label"], r["tweet_text"])
+            for r in rows
+        ]
+
+    async def get_author_feedback_counts(self, handle: str, days: int = 60) -> tuple[int, int]:
+        sql = (
+            "SELECT "
+            "  SUM(CASE WHEN label='up' THEN 1 ELSE 0 END) AS ups, "
+            "  SUM(CASE WHEN label='down' THEN 1 ELSE 0 END) AS downs "
+            "FROM feedback "
+            "WHERE author_handle = ? AND created_at >= datetime('now', ?)"
+        )
+        days_clause = f"-{int(days)} days"
+        async with self.conn.execute(sql, (handle.lower(), days_clause)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return 0, 0
+        return int(row["ups"] or 0), int(row["downs"] or 0)
+
+    async def get_muted_until(self, handle: str) -> str | None:
+        async with self.conn.execute(
+            "SELECT muted_until FROM author_scores WHERE handle = ?",
+            (handle.lower(),),
+        ) as cur:
+            row = await cur.fetchone()
+        return row["muted_until"] if row and row["muted_until"] else None
+
+    async def add_feedback(
+        self,
+        *,
+        tweet_id: str,
+        topic_name: str | None,
+        author_handle: str,
+        label: str,
+        tweet_text: str,
+        metrics: dict | None = None,
+    ) -> None:
+        metrics_json = json.dumps(metrics) if metrics else None
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO feedback("
+            "tweet_id, topic_name, author_handle, label, tweet_text, tweet_metrics_json"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (tweet_id, topic_name, author_handle.lower(), label, tweet_text, metrics_json),
+        )
+        await self.conn.commit()

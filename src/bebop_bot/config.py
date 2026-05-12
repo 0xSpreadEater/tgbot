@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     telegram_user_id: int
     db_path: str = "./bebop.db"
     log_level: str = "INFO"
+    x_bearer_token: str = ""
+    anthropic_api_key: str = ""
+    claude_model: str = "claude-sonnet-4-5"
 
     model_config = SettingsConfigDict(
         env_file=".env",
