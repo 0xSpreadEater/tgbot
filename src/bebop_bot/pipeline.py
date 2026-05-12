@@ -20,6 +20,7 @@ async def run_roundup(
     advance_since_id: bool = True,
     force: bool = False,
     manual_scan: bool = False,
+    skip_topics: bool = False,
 ) -> dict[str, tuple[str, list[ScoredTweet]]]:
     results: dict[str, tuple[str, list[ScoredTweet]]] = {}
     try:
@@ -27,7 +28,6 @@ async def run_roundup(
             log.info("roundup_skipped_paused")
             return {}
 
-        topics = await db.get_topics()
         allowlist = await db.get_allowlist()
         threshold_raw = await db.get_setting("threshold", "2")
         try:
@@ -38,6 +38,8 @@ async def run_roundup(
         ups = await db.get_recent_feedback("up", 15)
         downs = await db.get_recent_feedback("down", 15)
 
+        topics = [] if skip_topics else await db.get_topics()
+
         log.info(
             "roundup_start",
             extra={
@@ -45,6 +47,7 @@ async def run_roundup(
                 "allowlist": len(allowlist),
                 "threshold": threshold,
                 "advance_since_id": advance_since_id,
+                "scan_mode": "emerging_only" if skip_topics else "full",
             },
         )
 

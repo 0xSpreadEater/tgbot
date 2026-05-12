@@ -1,6 +1,12 @@
 import pytest
 
-from bebop_bot.db import apply_phase4_migration, apply_schema, connect, count_rows
+from bebop_bot.db import (
+    apply_calibration_source_migration,
+    apply_phase4_migration,
+    apply_schema,
+    connect,
+    count_rows,
+)
 from bebop_bot.seed import (
     DEFAULT_SETTINGS,
     SEED_ALLOWLIST,
@@ -50,6 +56,7 @@ async def test_seed_all_inserts_and_is_idempotent(db_path):
     try:
         await apply_schema(conn)
         await apply_phase4_migration(conn)
+        await apply_calibration_source_migration(conn)
         first = await seed_all(conn)
         assert first["topics"] == len(SEED_TOPICS)
         assert first["allowlist"] == len(SEED_ALLOWLIST)

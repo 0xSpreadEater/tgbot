@@ -275,6 +275,19 @@ async def apply_phase4_migration(conn: aiosqlite.Connection) -> None:
     )
 
 
+async def apply_calibration_source_migration(conn: aiosqlite.Connection) -> None:
+    """Add `source` column to viral_seed_examples if missing. Idempotent."""
+    async with conn.execute("PRAGMA table_info(viral_seed_examples)") as cur:
+        cols = await cur.fetchall()
+    if not any((c[1] if not isinstance(c, aiosqlite.Row) else c["name"]) == "source" for c in cols):
+        await conn.execute(
+            "ALTER TABLE viral_seed_examples ADD COLUMN source TEXT "
+            "NOT NULL DEFAULT 'seed'"
+        )
+        await conn.commit()
+        log.info("calibration_source_migration_applied")
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     from bebop_bot.seed import seed_all
 
@@ -282,6 +295,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     conn = await connect(db_path)
     await apply_schema(conn)
     await apply_phase4_migration(conn)
+    await apply_calibration_source_migration(conn)
     await seed_all(conn)
     log.info("db_init_done", extra={"db_path": db_path})
     return conn
@@ -781,7 +795,7 @@ class Db:
         rows = await fetch_all(
             self.conn,
             "SELECT name, chain, window_start, window_end, signals_json, "
-            "rationale, added_at FROM viral_seed_examples ORDER BY id",
+            "rationale, added_at, source FROM viral_seed_examples ORDER BY id",
         )
         out = []
         for r in rows:
@@ -799,8 +813,37 @@ class Db:
                 "handles": sigs.get("handles", []),
                 "rationale": r["rationale"],
                 "added_at": r["added_at"],
+                "source": r["source"] if "source" in r.keys() else "seed",  # noqa: SIM118
             })
         return out
+
+    async def get_viral_seed_example_by_name(self, name: str) -> dict | None:
+        """Case-insensitive lookup by name."""
+        async with self.conn.execute(
+            "SELECT name, chain, window_start, window_end, signals_json, "
+            "rationale, added_at, source FROM viral_seed_examples "
+            "WHERE LOWER(name) = LOWER(?)",
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        try:
+            sigs = json.loads(row["signals_json"])
+        except (json.JSONDecodeError, TypeError):
+            sigs = {}
+        return {
+            "name": row["name"],
+            "chain": row["chain"],
+            "window_start": row["window_start"],
+            "window_end": row["window_end"],
+            "signals": sigs.get("signals", []),
+            "phrases": sigs.get("phrases", []),
+            "handles": sigs.get("handles", []),
+            "rationale": row["rationale"],
+            "added_at": row["added_at"],
+            "source": row["source"] if "source" in row.keys() else "seed",  # noqa: SIM118
+        }
 
     async def add_viral_seed_example(
         self,
@@ -812,18 +855,35 @@ class Db:
         phrases: list[str],
         handles: list[str],
         rationale: str,
+        source: str = "user_added",
     ) -> bool:
         signals_json = json.dumps({
             "signals": signals, "phrases": phrases, "handles": handles,
         })
         cur = await self.conn.execute(
             "INSERT OR IGNORE INTO viral_seed_examples("
-            "name, chain, window_start, window_end, signals_json, rationale) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
-            (name, chain, window_start, window_end, signals_json, rationale),
+            "name, chain, window_start, window_end, signals_json, rationale, source) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (name, chain, window_start, window_end, signals_json, rationale, source),
         )
         await self.conn.commit()
         return cur.rowcount > 0
+
+    async def delete_viral_seed_example(self, name: str) -> bool:
+        """Case-insensitive delete by name."""
+        cur = await self.conn.execute(
+            "DELETE FROM viral_seed_examples WHERE LOWER(name) = LOWER(?)",
+            (name,),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def count_viral_seed_examples(self) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM viral_seed_examples"
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
 
     async def get_viral_handles(self) -> set[str]:
         rows = await fetch_all(self.conn, "SELECT handle FROM viral_handles")

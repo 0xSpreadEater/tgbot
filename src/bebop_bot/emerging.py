@@ -25,6 +25,7 @@ class EmergingToken:
     weighted_24h: float
     raw_24h: int
     sample_tweet_ids: list[str] = field(default_factory=list)
+    top_tweet_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class EmergingEntity:
     weighted_24h: float
     raw_24h: int
     sample_tweet_ids: list[str] = field(default_factory=list)
+    top_tweet_url: str | None = None
 
 
 def _author_weight(tweet: Any, allowlist: set[str]) -> float:
@@ -103,13 +105,14 @@ def _aggregate_mentions(
     extract_fn,
     allowlist: set[str],
 ) -> dict[str, dict[str, Any]]:
-    """Aggregate per-term: weighted_count, raw_count, unique_authors, sample_tweet_ids."""
+    """Aggregate per-term: weighted_count, raw_count, unique_authors, sample_tweet_ids, tweets."""
     by_term: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "weighted": 0.0,
             "raw": 0,
             "authors": set(),
             "tweet_ids": [],
+            "tweets": [],
         }
     )
     for t in pool:
@@ -125,9 +128,72 @@ def _aggregate_mentions(
             entry["weighted"] += weight
             entry["raw"] += 1
             entry["authors"].add(handle)
+            entry["tweets"].append(t)
             if len(entry["tweet_ids"]) < 5:
                 entry["tweet_ids"].append(tid)
     return by_term
+
+
+def _tweet_url(t: Any) -> str | None:
+    url = getattr(t, "url", None)
+    if url:
+        return str(url)
+    handle = getattr(t, "author_handle", None)
+    tid = getattr(t, "id", None)
+    if handle and tid:
+        return f"https://x.com/{handle}/status/{tid}"
+    return None
+
+
+def _score_tweet_for_top_pick(t: Any, allowlist: set[str]) -> float:
+    return (
+        _author_weight(t, allowlist) * 2.0
+        + float(getattr(t, "like_count", 0) or 0) / 100.0
+        + (
+            float(getattr(t, "reply_count", 0) or 0)
+            + float(getattr(t, "retweet_count", 0) or 0)
+        ) / 50.0
+    )
+
+
+def _select_top_tweet_for_entity(
+    observations: list[Any], allowlist: set[str],
+) -> Any | None:
+    if not observations:
+        return None
+    return max(observations, key=lambda t: _score_tweet_for_top_pick(t, allowlist))
+
+
+def _select_top_tweet_fallback_by_likes(observations: list[Any]) -> Any | None:
+    """Fallback ranking for tokens: highest like_count, tiebreak created_at desc."""
+    if not observations:
+        return None
+    def _key(t: Any) -> tuple[int, str]:
+        likes = int(getattr(t, "like_count", 0) or 0)
+        created = getattr(t, "created_at", None)
+        created_str = created.isoformat() if hasattr(created, "isoformat") else str(created or "")
+        return (likes, created_str)
+    return max(observations, key=_key)
+
+
+async def _select_top_tweet_for_token(
+    claude: Any, observations: list[Any], token: str, allowlist: set[str],
+) -> Any | None:
+    if not observations:
+        return None
+    if claude is not None:
+        try:
+            reps = await claude.pick_representative_tweets(
+                observations, token, limit=2,
+            )
+            if reps:
+                return reps[0]
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "pick_representative_tweets_failed",
+                extra={"token_symbol": token},
+            )
+    return _select_top_tweet_fallback_by_likes(observations)
 
 
 async def detect_tokens(
@@ -137,6 +203,7 @@ async def detect_tokens(
     cycle_ts: datetime,
     threshold: float,
     cooc_graph: dict,
+    claude: Any = None,
 ) -> list[EmergingToken]:
     """Detect emerging tokens across EVM + Solana sweep pools."""
     out: list[EmergingToken] = []
@@ -171,11 +238,16 @@ async def detect_tokens(
             )
             if score.composite < threshold:
                 continue
+            top_tweet = await _select_top_tweet_for_token(
+                claude, data["tweets"], token, allowlist,
+            )
+            top_tweet_url = _tweet_url(top_tweet) if top_tweet is not None else None
             out.append(EmergingToken(
                 token=token, chain=chain, score=score,
                 unique_authors_24h=unique,
                 weighted_24h=data["weighted"], raw_24h=data["raw"],
                 sample_tweet_ids=list(data["tweet_ids"]),
+                top_tweet_url=top_tweet_url,
             ))
             try:
                 await db.insert_entity_mention(
@@ -244,11 +316,14 @@ async def detect_entities(
         )
         if score.composite < threshold:
             continue
+        top_tweet = _select_top_tweet_for_entity(data["tweets"], allowlist)
+        top_tweet_url = _tweet_url(top_tweet) if top_tweet is not None else None
         out.append(EmergingEntity(
             entity_type=entity_type, term=term, score=score,
             unique_authors_24h=unique,
             weighted_24h=data["weighted"], raw_24h=data["raw"],
             sample_tweet_ids=list(data["tweet_ids"]),
+            top_tweet_url=top_tweet_url,
         ))
         try:
             await db.insert_entity_mention(
@@ -325,6 +400,7 @@ async def run_emerging(
     # Step 4-6: four tracks
     tokens_results = await detect_tokens(
         db, per_chain, allowlist, cycle_ts, threshold, cooc_graph,
+        claude=claude,
     )
     sectors_results = await detect_entities(
         db, sweep_pool, allowlist, "sector", sector_dict,
@@ -348,6 +424,12 @@ async def run_emerging(
         await db.get_setting("strong_convergence_claude_threshold", "4") or 4
     )
     viral_seeds = await db.get_viral_seed_examples()
+
+    top_tweet_by_entity: dict[tuple[str, str], str | None] = {}
+    for t in tokens_results:
+        top_tweet_by_entity[("token", t.token)] = t.top_tweet_url
+    for e in sectors_results + venues_results + mechanisms_results:
+        top_tweet_by_entity[(e.entity_type, e.term)] = e.top_tweet_url
 
     convergence_events: list[dict] = []
     candidate_entities: list[tuple[str, str]] = (
@@ -416,6 +498,7 @@ async def run_emerging(
             "claude_confidence": claude_confidence,
             "claude_rationale": claude_rationale,
             "summary": summary,
+            "top_tweet_url": top_tweet_by_entity.get((ent_type, ent_term)),
         })
 
     # Step 8: propose new dict terms via Claude

@@ -3,7 +3,8 @@ import html
 import json
 import logging
 import os
-from datetime import UTC, datetime, timedelta
+import re
+from datetime import UTC, date, datetime, timedelta
 
 import aiosqlite
 from telegram import Update
@@ -39,8 +40,10 @@ HELP_TEXT = (
     "/test &lt;query&gt; — fetch 5 most recent (no scoring, no save)\n"
     "\n"
     "<b>Roundup</b>\n"
-    "/scan — manual force scan (no rate limit, ignores /pause)\n"
-    "/run — manual scan (60-min rate limit, respects /pause)\n"
+    "/scan — manual scan of emerging coins and trends ONLY (no topic "
+    "roundup, no rate limit, ignores /pause)\n"
+    "/run — full manual scan including topics (60-min rate limit, "
+    "respects /pause)\n"
     "/pause — stop scheduled cycles (Phase 5)\n"
     "/resume — resume scheduled cycles\n"
     "/status — bot health\n"
@@ -50,6 +53,10 @@ HELP_TEXT = (
     "/rubric — show, /rubric set &lt;text&gt;, /rubric clear\n"
     "/learnings — summarize patterns from recent feedback\n"
     "/calibrate &lt;score&gt; | &lt;tweet text&gt; — label a manual example\n"
+    "/calibration — list calibration examples\n"
+    "/calibration show &lt;name&gt; — full rationale for one\n"
+    "/calibration add NAME | CHAIN | DATE | SIGNALS | RATIONALE\n"
+    "/calibration remove &lt;name&gt; — delete (asks for confirmation)\n"
     "\n"
     "<b>Authors</b>\n"
     "/allow &lt;handle&gt; — add to allowlist\n"
@@ -444,7 +451,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     x_client, claude_client, db = clients
     settings = context.application.bot_data["settings"]
     chat_id = update.effective_chat.id if update.effective_chat else settings.telegram_user_id
-    await _reply(update, "Running manual scan...")
+    await _reply(update, "Running manual emerging scan (no topic roundup)...")
     try:
         await pipelinem.run_roundup(
             db=db,
@@ -452,9 +459,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             claude=claude_client,
             bot=context.bot,
             chat_id=chat_id,
-            advance_since_id=True,
+            advance_since_id=False,
             force=True,
             manual_scan=True,
+            skip_topics=True,
         )
     except Exception:  # noqa: BLE001
         log.exception("scan_failed")
@@ -1004,6 +1012,309 @@ async def cmd_seed_viral_example(
     )
 
 
+# ---------------------------------------------------------------------------
+# /calibration: manage viral_seed_examples from Telegram
+# ---------------------------------------------------------------------------
+
+_KNOWN_CHAINS: frozenset[str] = frozenset({
+    "evm", "solana", "base", "abstract", "megaeth", "hyperliquid",
+    "plasma", "monad", "sonic", "berachain", "tempo", "ethereum",
+    "arbitrum", "optimism", "polygon", "bnb",
+})
+
+_VALID_SIGNALS: frozenset[str] = frozenset({
+    "novel_mechanism", "new_venue_context", "known_builder",
+    "recursive_lang", "backing_event", "builder_ape_overlap",
+    "fair_launch_lang",
+})
+
+_CHAIN_RE = re.compile(r"^[a-z][a-z0-9-]{1,20}$")
+
+_CALIBRATION_USAGE = (
+    "<b>/calibration</b> — manage historical viral-token examples\n\n"
+    "<b>Subcommands</b>\n"
+    "/calibration list — list all examples\n"
+    "/calibration show &lt;name&gt; — show one in full\n"
+    "/calibration add NAME | CHAIN | YYYY-MM-DD | SIGNALS | RATIONALE\n"
+    "/calibration remove &lt;name&gt; — delete one (asks for confirmation)\n\n"
+    "<b>Valid signals</b>\n"
+    f"{', '.join(sorted(_VALID_SIGNALS))}\n\n"
+    "Date is the window center; bot derives a 14-day window ending on it."
+)
+
+
+def _calibration_add_example_line() -> str:
+    return (
+        "Example:\n"
+        "<code>/calibration add Plasma launch | plasma | 2026-09-15 | "
+        "new_venue_context, novel_mechanism, known_builder | "
+        "Plasma launched as Bitcoin sidechain optimized for USDT transfers. "
+        "Brand-new-chain + Tether backing + cross-chain bridging team.</code>"
+    )
+
+
+@restricted
+async def cmd_calibration_root(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    args = context.args or []
+    if not args:
+        await _reply(update, _CALIBRATION_USAGE, parse_mode=ParseMode.HTML)
+        return
+    sub = args[0].lower()
+    rest_args = args[1:]
+    if sub == "list":
+        await _cmd_calibration_list(update, context)
+    elif sub == "add":
+        await _cmd_calibration_add(update, context, rest_args)
+    elif sub == "remove":
+        await _cmd_calibration_remove(update, context, rest_args)
+    elif sub == "show":
+        await _cmd_calibration_show(update, context, rest_args)
+    else:
+        await _reply(update, _CALIBRATION_USAGE, parse_mode=ParseMode.HTML)
+
+
+async def _cmd_calibration_list(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    db = _db_wrapper(context)
+    examples = await db.get_viral_seed_examples()
+    if not examples:
+        await _reply(update, "No calibration examples yet. Use /calibration add to create one.")
+        return
+    examples_sorted = sorted(examples, key=lambda e: (e.get("name") or "").lower())
+    lines = [f"<b>Calibration examples</b> ({len(examples_sorted)} total)", ""]
+    for e in examples_sorted:
+        name = html.escape(str(e.get("name") or ""))
+        chain = html.escape(str(e.get("chain") or ""))
+        ws = e.get("window_start") or ""
+        we = e.get("window_end") or ""
+        marker = " [user-added]" if e.get("source") == "user_added" else ""
+        lines.append(f"• <b>{name}</b> — {chain}, {html.escape(ws)} to {html.escape(we)}{marker}")
+    lines.append("")
+    lines.append("<i>Use /calibration show NAME to see the full rationale.</i>")
+    await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _cmd_calibration_show(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    rest_args: list[str],
+) -> None:
+    if not rest_args:
+        await _reply(update, "Usage: /calibration show <name>")
+        return
+    name = " ".join(rest_args).strip()
+    db = _db_wrapper(context)
+    example = await db.get_viral_seed_example_by_name(name)
+    if not example:
+        await _reply(
+            update,
+            f"No example named '{name}'. Use /calibration list to see what's there.",
+        )
+        return
+    signals = ", ".join(example.get("signals") or [])
+    rationale = example.get("rationale") or ""
+    body = (
+        f"<b>{html.escape(example['name'])}</b>\n"
+        f"Source: {html.escape(example.get('source') or 'seed')}\n"
+        f"Chain: {html.escape(example.get('chain') or '')}\n"
+        f"Window: {html.escape(example.get('window_start') or '')} to "
+        f"{html.escape(example.get('window_end') or '')}\n"
+        f"Signals: {html.escape(signals)}\n\n"
+        f"<b>Rationale</b>\n"
+        f"<i>{html.escape(rationale)}</i>"
+    )
+    await _reply(update, body, parse_mode=ParseMode.HTML)
+
+
+def _parse_calibration_add_payload(payload: str) -> tuple[str, str, str, list[str], str]:
+    """Parse the pipe-separated add payload. Raises ValueError on failure."""
+    parts = [p.strip() for p in payload.split("|")]
+    if len(parts) != 5:
+        raise ValueError(
+            f"expected 5 pipe-separated fields, got {len(parts)}. "
+            "Format: NAME | CHAIN | YYYY-MM-DD | SIGNALS | RATIONALE"
+        )
+    name, chain, date_str, signals_str, rationale = parts
+
+    if not (3 <= len(name) <= 80):
+        raise ValueError("NAME must be 3-80 characters.")
+
+    chain_l = chain.lower()
+    if not _CHAIN_RE.match(chain_l):
+        raise ValueError(
+            "CHAIN must be lowercase, 2-21 chars, match [a-z][a-z0-9-]+. "
+            f"Got: '{chain}'"
+        )
+
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError as e:
+        raise ValueError(f"DATE must be YYYY-MM-DD: {e}") from e
+    today = date.today()
+    if d > today:
+        raise ValueError(f"DATE must be on or before today ({today.isoformat()}).")
+    if d < date(2020, 1, 1):
+        raise ValueError("DATE must be on or after 2020-01-01.")
+
+    raw_signals = [s.strip() for s in signals_str.split(",") if s.strip()]
+    if not raw_signals:
+        raise ValueError(
+            "SIGNALS required. Valid: " + ", ".join(sorted(_VALID_SIGNALS))
+        )
+    # Dedupe preserving order
+    seen: set[str] = set()
+    signals: list[str] = []
+    for s in raw_signals:
+        if s in seen:
+            continue
+        if s not in _VALID_SIGNALS:
+            raise ValueError(
+                f"Invalid signal '{s}'. Valid: " + ", ".join(sorted(_VALID_SIGNALS))
+            )
+        seen.add(s)
+        signals.append(s)
+
+    rationale = rationale.strip()
+    if not (20 <= len(rationale) <= 2000):
+        raise ValueError("RATIONALE must be 20-2000 characters.")
+
+    return name, chain_l, d.isoformat(), signals, rationale
+
+
+async def _cmd_calibration_add(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    rest_args: list[str],
+) -> None:
+    payload = " ".join(rest_args).strip()
+    if not payload:
+        await _reply(
+            update,
+            "Usage: /calibration add NAME | CHAIN | YYYY-MM-DD | "
+            "SIGNALS | RATIONALE\n\n" + _calibration_add_example_line(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        name, chain, date_iso, signals, rationale = _parse_calibration_add_payload(payload)
+    except ValueError as e:
+        await _reply(
+            update,
+            f"Rejected: {e}\n\n{_calibration_add_example_line()}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    db = _db_wrapper(context)
+    existing = await db.get_viral_seed_example_by_name(name)
+    if existing:
+        await _reply(
+            update,
+            f"An example named '{html.escape(name)}' already exists. "
+            f"Use /calibration show {html.escape(name)} to see it, or "
+            f"/calibration remove {html.escape(name)} first.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    window_start = (d - timedelta(days=14)).isoformat()
+    window_end = d.isoformat()
+
+    if chain not in _KNOWN_CHAINS:
+        log.warning(
+            "calibration_unknown_chain",
+            extra={"chain_name": chain, "example_name": name},
+        )
+
+    ok = await db.add_viral_seed_example(
+        name=name,
+        chain=chain,
+        window_start=window_start,
+        window_end=window_end,
+        signals=signals,
+        phrases=[],
+        handles=[],
+        rationale=rationale,
+        source="user_added",
+    )
+    if not ok:
+        await _reply(
+            update,
+            f"Could not add '{html.escape(name)}' (name conflict).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    total = await db.count_viral_seed_examples()
+    await _reply(
+        update,
+        f"Added calibration example: {html.escape(name)} "
+        f"({html.escape(chain)}, {window_start} to {window_end}). "
+        "It'll appear in the next convergence Claude judge call's "
+        f"few-shot pool. {total} examples total.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _cmd_calibration_remove(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    rest_args: list[str],
+) -> None:
+    if not rest_args:
+        await _reply(update, "Usage: /calibration remove <name> [confirm]")
+        return
+
+    confirm = False
+    name_parts = list(rest_args)
+    if name_parts and name_parts[-1].lower() == "confirm":
+        confirm = True
+        name_parts = name_parts[:-1]
+    name = " ".join(name_parts).strip()
+    if not name:
+        await _reply(update, "Usage: /calibration remove <name> [confirm]")
+        return
+
+    db = _db_wrapper(context)
+    example = await db.get_viral_seed_example_by_name(name)
+    if not example:
+        await _reply(
+            update,
+            f"No example named '{html.escape(name)}'.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not confirm:
+        body = (
+            "<b>Remove calibration example?</b>\n"
+            f"Name: {html.escape(example['name'])}\n"
+            f"Source: {html.escape(example.get('source') or 'seed')}\n"
+            f"Chain: {html.escape(example.get('chain') or '')}\n\n"
+            f"Reply with <code>/calibration remove {html.escape(example['name'])} "
+            "confirm</code> to delete."
+        )
+        await _reply(update, body, parse_mode=ParseMode.HTML)
+        return
+
+    deleted = await db.delete_viral_seed_example(name)
+    if deleted:
+        await _reply(
+            update,
+            f"Removed '{html.escape(example['name'])}'.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await _reply(
+            update,
+            f"No example named '{html.escape(name)}'.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("handler_error", exc_info=context.error)
 
@@ -1047,6 +1358,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("viral_handle", cmd_viral_handle))
     app.add_handler(CommandHandler("seed_viral_example", cmd_seed_viral_example))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
+    app.add_handler(CommandHandler("calibration", cmd_calibration_root))
     app.add_handler(CallbackQueryHandler(on_venue_suggestion_callback, pattern=r"^s_v:"))
     app.add_handler(CallbackQueryHandler(on_suggestion_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(on_feedback_callback, pattern=r"^[udm]:"))
