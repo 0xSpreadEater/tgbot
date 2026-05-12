@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from bebop_bot import digest
+from bebop_bot import emerging as emerging_mod
 from bebop_bot.filter import filter_topic
 from bebop_bot.models import ScoredTweet
 
@@ -92,8 +93,17 @@ async def run_roundup(
             )
             results[topic.name] = (summary, scored)
 
+        emerging_result: dict | None = None
+        try:
+            emerging_result = await emerging_mod.run_emerging(
+                db=db, x=x, claude=claude, bot=bot, chat_id=chat_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("emerging_run_failed", extra={"error": str(e)})
+
         await digest.send_digest(
             bot, chat_id, results, db=db, manual_scan=manual_scan,
+            emerging=emerging_result,
         )
         await db.set_setting("last_run_at", datetime.now(UTC).isoformat())
         log.info(

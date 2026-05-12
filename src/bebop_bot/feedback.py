@@ -121,6 +121,42 @@ async def on_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 @restricted
+async def on_venue_suggestion_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    q = update.callback_query
+    if q is None:
+        return
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "s_v":
+        return
+    action, venue_term = parts[1], parts[2]
+    db = _db(context)
+
+    if action == "accept":
+        await db.set_venue_suggestion(venue_term, "accepted")
+        msg = f"Accepted {venue_term}. Will be added to active sweep set."
+    elif action == "later":
+        await db.set_venue_suggestion(
+            venue_term, "pending",
+            last_suggested_at=datetime.now(UTC).isoformat(),
+        )
+        msg = f"Will suggest {venue_term} again later."
+    elif action == "never":
+        await db.set_venue_suggestion(venue_term, "blocked")
+        msg = f"Won't suggest {venue_term} again."
+    else:
+        return
+
+    try:
+        await q.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=None)
+    except Exception:  # noqa: BLE001
+        log.exception("venue_suggestion_edit_failed", extra={"entity_term": venue_term})
+
+
+@restricted
 async def on_suggestion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if q is None:

@@ -211,14 +211,243 @@ class ClaudeClient:
             )
             return ""
 
-    async def pick_representative_tweets(self, *args, **kwargs):
-        raise NotImplementedError("pick_representative_tweets is added in Phase 4")
+    async def pick_representative_tweets(
+        self, tweets: list[Tweet], entity_term: str, limit: int = 5,
+    ) -> list[Tweet]:
+        """Best-effort representative pick. Returns up to `limit` tweets;
+        if Claude is unavailable, falls back to ranking by engagement."""
+        if not tweets:
+            return []
+        if len(tweets) <= limit:
+            return list(tweets)
 
-    async def summarize_entity_emergence(self, *args, **kwargs):
-        raise NotImplementedError("summarize_entity_emergence is added in Phase 4")
+        ranked = sorted(
+            tweets,
+            key=lambda t: (
+                getattr(t, "like_count", 0)
+                + getattr(t, "retweet_count", 0)
+                + getattr(t, "reply_count", 0)
+            ),
+            reverse=True,
+        )
+        return ranked[:limit]
 
-    async def propose_dictionary_terms(self, *args, **kwargs):
-        raise NotImplementedError("propose_dictionary_terms is added in Phase 4")
+    async def summarize_entity_emergence(
+        self, entity_type: str, entity_term: str, tweets: list[Tweet],
+    ) -> str:
+        if not tweets:
+            return ""
+        body = "\n".join(
+            f"- {t.text[:200]} (@{t.author_handle})" for t in tweets[:10]
+        )
+        system = (
+            "You are summarizing why a crypto entity is showing emerging "
+            "discussion. 1-2 sentences, neutral, factual, no hype. "
+            "Plain text only, no emoji."
+        )
+        user = (
+            f"Entity type: {entity_type}\nEntity term: {entity_term}\n\n"
+            f"Recent tweets:\n{body}"
+        )
+        try:
+            resp = await self._client.messages.create(
+                model=self.model,
+                max_tokens=300,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return "".join(
+                block.text for block in resp.content
+                if getattr(block, "type", None) == "text"
+            ).strip()
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "claude_entity_emergence_error",
+                extra={
+                    "entity_type": entity_type,
+                    "entity_term": entity_term,
+                    "error": str(e),
+                },
+            )
+            return ""
+
+    async def propose_dictionary_terms(
+        self,
+        sample: list[dict],
+        existing_sectors: list[str],
+        existing_venues: list[str],
+        existing_mechanisms: list[str] | None = None,
+    ) -> list[tuple[str, str]]:
+        """Ask Claude to propose new sector / venue / mechanism terms.
+        Returns a list of (type, term) pairs."""
+        if not sample:
+            return []
+        existing_mechanisms = existing_mechanisms or []
+        system = (
+            "You scan recent crypto tweets to propose additions to three "
+            "dictionaries: SECTORS (thematic narratives, e.g. 'restaking', "
+            "'prediction markets'), VENUES (chains, exchanges, launchpads, "
+            "e.g. 'MegaETH', 'pump.fun'), and MECHANISMS (token standards, "
+            "AMM patterns, launch curves, yield-composition patterns, e.g. "
+            "'ERC404', 'bonding curve', 'recursive PT', 'mine-to-earn').\n\n"
+            "Propose only NEW terms not already in the lists provided. Each "
+            "bucket gets up to 10 suggestions. Strict JSON output:\n"
+            '{"sectors": ["term1", ...], "venues": [...], "mechanisms": [...]}'
+        )
+        sample_block = "\n".join(
+            f"- {s.get('text', '')[:200]} (@{s.get('handle','')})" for s in sample[:60]
+        )
+        user = (
+            f"Existing sectors ({len(existing_sectors)}): "
+            f"{', '.join(existing_sectors[:80])}\n\n"
+            f"Existing venues ({len(existing_venues)}): "
+            f"{', '.join(existing_venues[:80])}\n\n"
+            f"Existing mechanisms ({len(existing_mechanisms)}): "
+            f"{', '.join(existing_mechanisms[:80])}\n\n"
+            f"Recent tweet sample ({len(sample)}):\n{sample_block}"
+        )
+        try:
+            resp = await self._client.messages.create(
+                model=self.model,
+                max_tokens=800,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            raw = "".join(
+                block.text for block in resp.content
+                if getattr(block, "type", None) == "text"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("claude_propose_terms_error", extra={"error": str(e)})
+            return []
+        parsed = _extract_json(raw)
+        if not parsed:
+            log.warning(
+                "claude_propose_terms_parse_fail",
+                extra={"raw_snippet": raw[:300]},
+            )
+            return []
+        out: list[tuple[str, str]] = []
+        for ent_type, key in (
+            ("sector", "sectors"),
+            ("venue", "venues"),
+            ("mechanism", "mechanisms"),
+        ):
+            items = parsed.get(key) or []
+            if not isinstance(items, list):
+                continue
+            for item in items[:10]:
+                if isinstance(item, str) and item.strip():
+                    out.append((ent_type, item.strip()))
+        return out
+
+    async def judge_strong_convergence(
+        self,
+        entity_type: str,
+        entity_term: str,
+        signals_fired: list[str],
+        evidence: dict,
+        viral_seeds: list[dict],
+        sample_tweets: list[Tweet],
+    ) -> dict:
+        """Ask Claude to score how strongly this entity resembles known viral
+        precursors. Returns {'confidence': 1-5, 'rationale': str}."""
+        system = (
+            "You are evaluating whether a crypto entity is showing precursor "
+            "signals to a viral run. You have a list of historical positive "
+            "examples (tokens / sectors / venues / mechanisms that ACTUALLY "
+            "went viral within 7-14 days of these signals being visible), and "
+            "a fresh candidate with which signals fired and what evidence "
+            "supports each.\n\n"
+            "Output strict JSON:\n"
+            '{"confidence": <1-5>, "rationale": "<1-2 sentences>"}\n\n'
+            "Scoring rubric:\n"
+            "  1 = unrelated coincidence; signals are weak or background-rate\n"
+            "  2 = some signal but pattern is incomplete or commonly misfires\n"
+            "  3 = signals match but I can't tell if it's converging or just noisy\n"
+            "  4 = pattern strongly resembles historical positives in this dataset\n"
+            "  5 = textbook precursor pattern; high confidence this is an early "
+            "viral candidate\n\n"
+            "Be CONSERVATIVE. False positives are cheaper than false negatives, "
+            "but the user reads every 'strong convergence' message. Reserve 5 "
+            "for patterns that line up with at least 2 historical positives "
+            "across multiple signal categories."
+        )
+
+        sig_lines = []
+        for name in signals_fired:
+            ev = evidence.get(name, {})
+            ev_str = json.dumps(ev)[:200]
+            sig_lines.append(f"  - {name}: {ev_str}")
+        sig_block = "\n".join(sig_lines) if sig_lines else "  (none)"
+
+        seed_lines = []
+        for s in viral_seeds[:15]:
+            seed_lines.append(
+                f"  - {s.get('name','?')} ({s.get('chain','?')}): "
+                f"signals={s.get('signals', [])}, "
+                f"phrases={s.get('phrases', [])[:8]}, "
+                f"rationale: {s.get('rationale','')[:300]}"
+            )
+        seed_block = "\n".join(seed_lines) if seed_lines else "  (none)"
+
+        tweet_lines = []
+        for i, t in enumerate(sample_tweets[:10], start=1):
+            text = (getattr(t, "text", "") or "")[:200]
+            handle = getattr(t, "author_handle", "")
+            tweet_lines.append(f"  {i}. {text} - @{handle}")
+        tweet_block = "\n".join(tweet_lines) if tweet_lines else "  (none)"
+
+        user = (
+            f"Candidate entity: {entity_type}: {entity_term}\n\n"
+            f"Signals fired ({len(signals_fired)}/7):\n{sig_block}\n\n"
+            f"Historical positive examples for comparison:\n{seed_block}\n\n"
+            f"Recent tweets mentioning this entity:\n{tweet_block}\n"
+        )
+        log.debug(
+            "claude_judge_strong_convergence_prompt",
+            extra={
+                "entity_type": entity_type,
+                "entity_term": entity_term,
+                "signals_fired_count": len(signals_fired),
+                "viral_seeds_count": len(viral_seeds),
+                "sample_tweets_count": len(sample_tweets),
+                "prompt_body": user[:4000],
+            },
+        )
+
+        try:
+            resp = await self._client.messages.create(
+                model=self.model,
+                max_tokens=400,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            raw = "".join(
+                block.text for block in resp.content
+                if getattr(block, "type", None) == "text"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "claude_judge_strong_convergence_error",
+                extra={
+                    "entity_type": entity_type,
+                    "entity_term": entity_term,
+                    "error": str(e),
+                },
+            )
+            return {"confidence": None, "rationale": None}
+
+        parsed = _extract_json(raw)
+        if not parsed:
+            return {"confidence": None, "rationale": None}
+        confidence_raw = parsed.get("confidence")
+        try:
+            confidence = max(1, min(5, int(confidence_raw)))
+        except (TypeError, ValueError):
+            confidence = None
+        rationale = str(parsed.get("rationale", ""))[:600]
+        return {"confidence": confidence, "rationale": rationale}
 
     async def summarize_learnings(
         self,

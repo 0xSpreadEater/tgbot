@@ -1,12 +1,15 @@
 import pytest
 
-from bebop_bot.db import apply_schema, connect, count_rows
+from bebop_bot.db import apply_phase4_migration, apply_schema, connect, count_rows
 from bebop_bot.seed import (
     DEFAULT_SETTINGS,
     SEED_ALLOWLIST,
+    SEED_MECHANISMS,
     SEED_SECTORS,
     SEED_TOPICS,
     SEED_VENUES,
+    SEED_VIRAL_EXAMPLES,
+    SEED_VIRAL_HANDLES,
     seed_all,
 )
 
@@ -46,12 +49,15 @@ async def test_seed_all_inserts_and_is_idempotent(db_path):
     conn = await connect(db_path)
     try:
         await apply_schema(conn)
+        await apply_phase4_migration(conn)
         first = await seed_all(conn)
         assert first["topics"] == len(SEED_TOPICS)
         assert first["allowlist"] == len(SEED_ALLOWLIST)
         assert first["sectors"] == len(SEED_SECTORS)
         assert first["venues"] == len(SEED_VENUES)
-        assert first["settings"] == len(DEFAULT_SETTINGS)
+        assert first["mechanisms"] == len(SEED_MECHANISMS)
+        assert first["viral_examples"] == len(SEED_VIRAL_EXAMPLES)
+        assert first["viral_handles"] == len(set(h.lower() for h in SEED_VIRAL_HANDLES))
 
         second = await seed_all(conn)
         for v in second.values():
@@ -61,6 +67,7 @@ async def test_seed_all_inserts_and_is_idempotent(db_path):
         assert await count_rows(conn, "allowlist") == len(SEED_ALLOWLIST)
         assert await count_rows(conn, "sector_dictionary") == len(SEED_SECTORS)
         assert await count_rows(conn, "venue_dictionary") == len(SEED_VENUES)
-        assert await count_rows(conn, "settings") == len(DEFAULT_SETTINGS)
+        assert await count_rows(conn, "mechanism_dictionary") == len(SEED_MECHANISMS)
+        assert await count_rows(conn, "viral_seed_examples") == len(SEED_VIRAL_EXAMPLES)
     finally:
         await conn.close()

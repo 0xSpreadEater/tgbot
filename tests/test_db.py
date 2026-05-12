@@ -3,6 +3,7 @@ import os
 import pytest
 
 from bebop_bot.db import (
+    apply_phase4_migration,
     apply_schema,
     connect,
     count_rows,
@@ -21,6 +22,7 @@ async def test_schema_creates_all_tables(db_path):
     conn = await connect(db_path)
     try:
         await apply_schema(conn)
+        await apply_phase4_migration(conn)
         async with conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ) as cur:
@@ -32,8 +34,36 @@ async def test_schema_creates_all_tables(db_path):
         "pending_feedback", "token_mentions", "token_metadata",
         "sector_dictionary", "venue_dictionary", "entity_mentions",
         "dictionary_feedback", "airdrop_opportunities", "settings",
+        "mechanism_dictionary", "entity_cooccurrences",
+        "convergence_signals", "convergence_events",
+        "viral_seed_examples", "venue_suggestion_state", "viral_handles",
     }
     assert expected.issubset(set(tables))
+
+
+async def test_phase4_migration_is_idempotent(db_path):
+    conn = await connect(db_path)
+    try:
+        await apply_schema(conn)
+        await apply_phase4_migration(conn)
+        await apply_phase4_migration(conn)
+        async with conn.execute(
+            "SELECT COUNT(*) AS n FROM settings WHERE key = 'convergence_signal_threshold'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["n"] == 1
+    finally:
+        await conn.close()
+
+
+async def test_seed_mechanisms_and_viral_examples(db_path):
+    conn = await init_db(db_path)
+    try:
+        assert await count_rows(conn, "mechanism_dictionary") >= 45
+        assert await count_rows(conn, "viral_seed_examples") == 11
+        assert await count_rows(conn, "viral_handles") >= 10
+    finally:
+        await conn.close()
 
 
 async def test_init_db_seeds_and_is_idempotent(db_path):
