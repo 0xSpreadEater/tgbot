@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# venvs
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# Build artifacts
+build/
+dist/
+
+# Local config / data
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
