@@ -120,18 +120,192 @@ async def _send_post(
     )
 
 
+async def send_convergence_block(
+    bot: Any, chat_id: int, convergence_events: list[dict],
+) -> None:
+    """Render the convergence block at the top of the digest."""
+    if not convergence_events:
+        return
+    strong = [e for e in convergence_events if e.get("tier") == "strong_convergence"]
+    normal = [e for e in convergence_events if e.get("tier") == "convergence"]
+
+    if strong:
+        lines = [f"<b>⚠️ Strong convergence ({len(strong)})</b>"]
+        for e in strong:
+            lines.append("")
+            conf = e.get("claude_confidence")
+            conf_str = f"Claude confidence {conf}/5, " if conf is not None else ""
+            lines.append(
+                f"<b>{html.escape(str(e.get('type','')))}: "
+                f"{html.escape(str(e.get('term','')))}</b> — "
+                f"{conf_str}{e.get('signal_count', 0)}/7 signals"
+            )
+            lines.append(f"<i>{html.escape(str(e.get('summary','')))}</i>")
+        await _send_plain(bot, chat_id, "\n".join(lines))
+
+    if normal:
+        lines = [f"<b>Convergence ({len(normal)})</b>"]
+        for e in normal:
+            lines.append("")
+            lines.append(
+                f"<b>{html.escape(str(e.get('type','')))}: "
+                f"{html.escape(str(e.get('term','')))}</b> — "
+                f"{e.get('signal_count', 0)}/7 signals"
+            )
+            lines.append(f"<i>{html.escape(str(e.get('summary','')))}</i>")
+        await _send_plain(bot, chat_id, "\n".join(lines))
+
+
+def _cooc_partner_line(
+    cooc_graph: dict, entity_type: str, entity_term: str, limit: int = 4,
+) -> str:
+    """Compact display: top co-occurrence partners under each entity."""
+    partners = cooc_graph.get((entity_type, entity_term), []) if cooc_graph else []
+    ranked = sorted(partners, key=lambda x: x[2], reverse=True)[:limit]
+    if not ranked:
+        return ""
+    parts = []
+    for ptype, pterm, _w in ranked:
+        parts.append(f"{html.escape(pterm)} ({html.escape(ptype)})")
+    return "<i>Co-occurs with: " + ", ".join(parts) + "</i>"
+
+
+async def send_emerging_track(
+    bot: Any,
+    chat_id: int,
+    track_label: str,
+    entries: list[Any],
+    cooc_graph: dict | None,
+) -> None:
+    """Render one emerging track (tokens / sectors / venues / mechanisms)."""
+    if not entries:
+        return
+    lines = [f"<b>{html.escape(track_label)} ({len(entries)})</b>"]
+    for e in entries[:15]:
+        if hasattr(e, "token"):
+            term = e.token
+            entity_type = "token"
+            header = (
+                f"<b>${html.escape(term)}</b> {html.escape(e.chain.upper())} "
+                f"score {e.score.composite:.1f}"
+            )
+        else:
+            term = e.term
+            entity_type = e.entity_type
+            header = (
+                f"<b>{html.escape(term)}</b> score {e.score.composite:.1f}"
+            )
+        lines.append("")
+        lines.append(header)
+        lines.append(
+            f"<i>n={e.score.narrowness:.0f} q={e.score.quality:.0f} "
+            f"m={e.score.momentum:.0f} c={e.score.coherence:.0f}, "
+            f"{e.unique_authors_24h} authors, {e.raw_24h} mentions</i>"
+        )
+        partner_line = _cooc_partner_line(cooc_graph or {}, entity_type, term)
+        if partner_line:
+            lines.append(partner_line)
+    await _send_plain(bot, chat_id, "\n".join(lines))
+
+
+async def send_new_dict_terms(
+    bot: Any, chat_id: int, new_dict_terms: list[tuple[str, str]],
+) -> None:
+    if not new_dict_terms:
+        return
+    by_type: dict[str, list[str]] = {}
+    for t, term in new_dict_terms:
+        by_type.setdefault(t, []).append(term)
+    lines = [f"<b>New dictionary terms ({len(new_dict_terms)})</b>"]
+    for t in ("sector", "venue", "mechanism"):
+        terms = by_type.get(t, [])
+        if terms:
+            joined = ", ".join(html.escape(x) for x in terms[:15])
+            lines.append(f"<b>{t}s:</b> {joined}")
+    await _send_plain(bot, chat_id, "\n".join(lines))
+
+
+def _venue_keyboard(term: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Accept", callback_data=f"s_v:accept:{term}"),
+            InlineKeyboardButton("Not now", callback_data=f"s_v:later:{term}"),
+            InlineKeyboardButton("Never", callback_data=f"s_v:never:{term}"),
+        ]
+    ])
+
+
+async def send_venue_suggestions(
+    bot: Any, chat_id: int, suggestions: list[dict],
+) -> None:
+    for s in suggestions:
+        term = s.get("venue_term", "")
+        n = s.get("n_cycles", 0)
+        m = s.get("unique_authors", 0)
+        text = (
+            "<b>📍 New venue suggestion</b>\n"
+            f"<b>{html.escape(term)}</b> has appeared in {n} cycles "
+            f"with {m} unique authors. Want to add this chain to the "
+            "active sweep set?"
+        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_venue_keyboard(term),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("venue_suggestion_send_failed", extra={"entity_term": term})
+
+
+async def send_emerging_blocks(
+    bot: Any,
+    chat_id: int,
+    emerging: dict,
+) -> None:
+    """Render the Phase 4 emerging blocks in the correct order."""
+    cooc_graph = emerging.get("cooc_graph") or {}
+
+    await send_convergence_block(bot, chat_id, emerging.get("convergence_events", []))
+    await send_emerging_track(
+        bot, chat_id, "Emerging tokens", emerging.get("tokens", []), cooc_graph,
+    )
+    await send_emerging_track(
+        bot, chat_id, "Emerging sectors", emerging.get("sectors", []), cooc_graph,
+    )
+    await send_emerging_track(
+        bot, chat_id, "Emerging venues", emerging.get("venues", []), cooc_graph,
+    )
+    await send_emerging_track(
+        bot, chat_id, "Emerging mechanisms", emerging.get("mechanisms", []), cooc_graph,
+    )
+    await send_new_dict_terms(bot, chat_id, emerging.get("new_dict_terms", []))
+    await send_venue_suggestions(bot, chat_id, emerging.get("venue_suggestions", []))
+
+
 async def send_digest(
     bot: Any,
     chat_id: int,
     results: dict[str, tuple[str, list[ScoredTweet]]],
     db: Any = None,
     manual_scan: bool = False,
+    emerging: dict | None = None,
 ) -> None:
     now = datetime.now(UTC)
     ts = now.strftime("%Y-%m-%d %H:%M UTC")
     header_title = "Manual scan" if manual_scan else "Roundup"
 
-    if not results:
+    has_results = bool(results)
+    has_emerging = bool(emerging) and any(
+        emerging.get(k) for k in (
+            "tokens", "sectors", "venues", "mechanisms",
+            "convergence_events", "new_dict_terms", "venue_suggestions",
+        )
+    )
+
+    if not has_results and not has_emerging:
         await _send_plain(
             bot, chat_id,
             f"<b>{header_title} - {ts}</b>\nNo posts cleared the threshold.",
@@ -145,6 +319,9 @@ async def send_digest(
         f"{n_topics} topics, {total} posts surfaced"
     )
     await _send_plain(bot, chat_id, header)
+
+    if emerging:
+        await send_emerging_blocks(bot, chat_id, emerging)
 
     for topic_name, (summary, posts) in results.items():
         if not posts:

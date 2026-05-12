@@ -1,5 +1,6 @@
 import hashlib
 import html
+import json
 import logging
 import os
 from datetime import UTC, datetime, timedelta
@@ -10,10 +11,15 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bebop_bot import db as dbm
+from bebop_bot import dictionary as dictm
 from bebop_bot import pipeline as pipelinem
 from bebop_bot.auth import restricted
 from bebop_bot.digest import relative_time
-from bebop_bot.feedback import on_feedback_callback, on_suggestion_callback
+from bebop_bot.feedback import (
+    on_feedback_callback,
+    on_suggestion_callback,
+    on_venue_suggestion_callback,
+)
 from bebop_bot.query_parser import normalize
 
 RATE_LIMIT_SECONDS = 60 * 60
@@ -53,17 +59,30 @@ HELP_TEXT = (
     "/unmute &lt;handle&gt; — clear muted_until\n"
     "\n"
     "<b>Emerging</b>\n"
+    "/emerging — show last cycle's emerging entities\n"
+    "/convergence — show last cycle's convergence events\n"
+    "/convergence_threshold &lt;n&gt; — set deterministic signal floor\n"
+    "/strong_convergence on|off — toggle Claude tier\n"
+    "/strong_threshold &lt;n&gt; — set Claude confidence floor\n"
+    "/dismiss — (coming soon)\n"
     "/chains — (coming soon)\n"
     "/sol_config — (coming soon)\n"
     "/evm_config — (coming soon)\n"
-    "/emerging — (coming soon)\n"
-    "/dismiss — (coming soon)\n"
     "\n"
     "<b>Dictionary</b>\n"
-    "/sectors — (coming soon)\n"
-    "/venues — (coming soon)\n"
-    "/sector — (coming soon)\n"
-    "/venue — (coming soon)\n"
+    "/sectors — list sector dictionary\n"
+    "/sector add &lt;term&gt; — add sector term\n"
+    "/sector remove &lt;term&gt; — remove sector term\n"
+    "/venues — list venue dictionary\n"
+    "/venue add|remove &lt;term&gt;\n"
+    "/mechanisms — list mechanism dictionary\n"
+    "/mechanism add|remove &lt;term&gt;\n"
+    "\n"
+    "<b>Viral seeds</b>\n"
+    "/viral_handles — list known builder handles\n"
+    "/viral_handle add|remove &lt;handle&gt;\n"
+    "/seed_viral_example — show last 3 viral seed examples\n"
+    "/seed_viral_example add &lt;json&gt; — append a viral seed\n"
     "\n"
     "<b>Backfill</b>\n"
     "/backfill — (coming soon)\n"
@@ -297,8 +316,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     threshold = await dbm.get_setting(conn, "threshold", "2")
     evm_on = await dbm.get_setting(conn, "chain_evm_enabled", "1")
     sol_on = await dbm.get_setting(conn, "chain_solana_enabled", "1")
+    conv_threshold = await dbm.get_setting(conn, "convergence_signal_threshold", "3")
+    strong_on = await dbm.get_setting(conn, "strong_convergence_enabled", "1")
+    strong_threshold = await dbm.get_setting(conn, "strong_convergence_claude_threshold", "4")
     topics_count = await dbm.count_rows(conn, "topics")
     allow_count = await dbm.count_rows(conn, "allowlist")
+    mech_total = await dbm.count_rows(conn, "mechanism_dictionary")
+    async with conn.execute(
+        "SELECT COUNT(*) AS n FROM mechanism_dictionary WHERE source = 'claude_proposed'"
+    ) as cur:
+        row = await cur.fetchone()
+    mech_proposed = int(row["n"]) if row else 0
+    viral_seeds_count = await dbm.count_rows(conn, "viral_seed_examples")
     settings = context.application.bot_data["settings"]
     db_path = settings.db_path
     try:
@@ -314,6 +343,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Threshold: {threshold}\n"
         f"Chains: EVM={'on' if evm_on == '1' else 'off'}, "
         f"Solana={'on' if sol_on == '1' else 'off'}\n"
+        f"Mechanisms tracked: {mech_total} ({mech_proposed} proposed)\n"
+        f"Convergence signal threshold: {conv_threshold}/7\n"
+        f"Strong convergence: {'on' if strong_on == '1' else 'off'} "
+        f"(threshold {strong_threshold}/5)\n"
+        f"Viral seed examples: {viral_seeds_count}\n"
         "Scheduler: not yet implemented\n"
         f"DB path: {html.escape(db_path)}, size: {size_str}"
     )
@@ -329,9 +363,7 @@ def _make_coming_soon(name: str):
 
 
 COMING_SOON_COMMANDS: tuple[str, ...] = (
-    "chains", "sol_config", "evm_config",
-    "emerging", "dismiss", "sectors", "venues", "sector", "venue",
-    "backfill",
+    "chains", "sol_config", "evm_config", "dismiss", "backfill",
 )
 
 
@@ -629,6 +661,346 @@ async def cmd_learnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply(update, text)
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: dictionary commands
+# ---------------------------------------------------------------------------
+
+
+def _entity_type_for_singular(cmd: str) -> str | None:
+    return {"sector": "sector", "venue": "venue", "mechanism": "mechanism"}.get(cmd)
+
+
+def _entity_type_for_plural(cmd: str) -> str | None:
+    return {
+        "sectors": "sector",
+        "venues": "venue",
+        "mechanisms": "mechanism",
+    }.get(cmd)
+
+
+async def _cmd_list_dictionary(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, entity_type: str,
+) -> None:
+    db = _db_wrapper(context)
+    rows = await db.get_dictionary(entity_type)
+    if not rows:
+        await _reply(update, f"No {entity_type} terms yet.")
+        return
+    lines = [f"<b>{entity_type.capitalize()} dictionary ({len(rows)})</b>"]
+    for r in rows[:80]:
+        weight = f"{r['weight']:.1f}"
+        marker = ""
+        if entity_type == "mechanism" and r.get("is_novelty_marker"):
+            marker = " *novelty"
+        lines.append(
+            f"- {html.escape(r['term'])} (w={weight}, {r['source']}){marker}"
+        )
+    if len(rows) > 80:
+        lines.append(f"... and {len(rows) - 80} more")
+    await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@restricted
+async def cmd_sectors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _cmd_list_dictionary(update, context, "sector")
+
+
+@restricted
+async def cmd_venues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _cmd_list_dictionary(update, context, "venue")
+
+
+@restricted
+async def cmd_mechanisms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _cmd_list_dictionary(update, context, "mechanism")
+
+
+async def _cmd_modify_dictionary(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, entity_type: str,
+) -> None:
+    args = context.args or []
+    if len(args) < 2 or args[0].lower() not in ("add", "remove"):
+        await _reply(
+            update,
+            f"Usage: /{entity_type} add <term>  |  /{entity_type} remove <term>",
+        )
+        return
+    action = args[0].lower()
+    term = " ".join(args[1:]).strip()
+    if not term:
+        await _reply(update, "Term is empty.")
+        return
+    db = _db_wrapper(context)
+    if action == "add":
+        ok = await dictm.add_term(
+            db, entity_type, term, weight=1.0, source="user_added",
+        )
+        await _reply(
+            update,
+            f"Added {entity_type} '{term}'." if ok else f"'{term}' already in dictionary.",
+        )
+    else:
+        ok = await dictm.remove_term(db, entity_type, term)
+        await _reply(
+            update,
+            f"Removed {entity_type} '{term}'." if ok else f"No {entity_type} named '{term}'.",
+        )
+
+
+@restricted
+async def cmd_sector(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _cmd_modify_dictionary(update, context, "sector")
+
+
+@restricted
+async def cmd_venue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _cmd_modify_dictionary(update, context, "venue")
+
+
+@restricted
+async def cmd_mechanism(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _cmd_modify_dictionary(update, context, "mechanism")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: convergence commands
+# ---------------------------------------------------------------------------
+
+
+@restricted
+async def cmd_convergence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = _db_wrapper(context)
+    events = await db.get_last_cycle_convergence_events()
+    if not events:
+        await _reply(update, "No convergence events in the most recent cycle.")
+        return
+    ts = events[0]["cycle_ts"]
+    strong = [e for e in events if e["tier"] == "strong_convergence"]
+    normal = [e for e in events if e["tier"] == "convergence"]
+    lines = [f"<b>Convergence — cycle {html.escape(str(ts))}</b>"]
+    lines.append(f"STRONG ({len(strong)}):")
+    for e in strong:
+        conf = e.get("claude_confidence")
+        conf_str = f"Claude {conf}/5, " if conf is not None else ""
+        lines.append(
+            f"  - {html.escape(e['entity_type'])}: "
+            f"{html.escape(e['entity_term'])} "
+            f"({conf_str}{e['signal_count']}/7 sigs)"
+        )
+        if e.get("summary"):
+            lines.append(f"    {html.escape(e['summary'])[:300]}")
+    lines.append(f"NORMAL ({len(normal)}):")
+    for e in normal:
+        lines.append(
+            f"  - {html.escape(e['entity_type'])}: "
+            f"{html.escape(e['entity_term'])} "
+            f"({e['signal_count']}/7 sigs)"
+        )
+    await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@restricted
+async def cmd_convergence_threshold(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    args = context.args or []
+    if not args:
+        db = _db_wrapper(context)
+        cur = await db.get_setting("convergence_signal_threshold", "3")
+        await _reply(update, f"Convergence signal threshold: {cur}/7")
+        return
+    try:
+        n = int(args[0])
+    except ValueError:
+        await _reply(update, "Threshold must be an integer 1..7.")
+        return
+    if not 1 <= n <= 7:
+        await _reply(update, "Threshold must be between 1 and 7.")
+        return
+    db = _db_wrapper(context)
+    await db.set_setting("convergence_signal_threshold", str(n))
+    await _reply(update, f"Convergence signal threshold set to {n}/7.")
+
+
+@restricted
+async def cmd_strong_convergence(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    args = context.args or []
+    if not args:
+        await _reply(update, "Usage: /strong_convergence on|off")
+        return
+    val = args[0].lower()
+    if val not in ("on", "off"):
+        await _reply(update, "Usage: /strong_convergence on|off")
+        return
+    db = _db_wrapper(context)
+    await db.set_setting("strong_convergence_enabled", "1" if val == "on" else "0")
+    await _reply(update, f"Strong convergence: {val}.")
+
+
+@restricted
+async def cmd_strong_threshold(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    args = context.args or []
+    if not args:
+        db = _db_wrapper(context)
+        cur = await db.get_setting("strong_convergence_claude_threshold", "4")
+        await _reply(update, f"Strong convergence Claude threshold: {cur}/5")
+        return
+    try:
+        n = int(args[0])
+    except ValueError:
+        await _reply(update, "Threshold must be an integer 1..5.")
+        return
+    if not 1 <= n <= 5:
+        await _reply(update, "Threshold must be between 1 and 5.")
+        return
+    db = _db_wrapper(context)
+    await db.set_setting("strong_convergence_claude_threshold", str(n))
+    await _reply(update, f"Strong convergence Claude threshold set to {n}/5.")
+
+
+@restricted
+async def cmd_emerging(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = _db_wrapper(context)
+    # Show the most recent cycle's entities from entity_mentions
+    conn = _conn(context)
+    async with conn.execute(
+        "SELECT MAX(cycle_ts) AS m FROM entity_mentions"
+    ) as cur:
+        row = await cur.fetchone()
+    if not row or not row["m"]:
+        await _reply(update, "No emerging entities recorded yet. Run /scan first.")
+        return
+    last_ts = row["m"]
+    rows = await dbm.fetch_all(
+        conn,
+        "SELECT entity_type, entity_term, weighted_count, raw_count, unique_authors "
+        "FROM entity_mentions WHERE cycle_ts = ? "
+        "ORDER BY entity_type, weighted_count DESC",
+        (last_ts,),
+    )
+    if not rows:
+        await _reply(update, "No emerging entities in the most recent cycle.")
+        return
+    lines = [f"<b>Emerging — cycle {html.escape(str(last_ts))}</b>"]
+    current_type = None
+    for r in rows[:80]:
+        et = r["entity_type"]
+        if et != current_type:
+            lines.append("")
+            lines.append(f"<b>{et}s</b>")
+            current_type = et
+        lines.append(
+            f"  - {html.escape(r['entity_term'])} "
+            f"(w={r['weighted_count']:.1f}, raw={r['raw_count']}, "
+            f"authors={r['unique_authors']})"
+        )
+    if len(rows) > 80:
+        lines.append(f"... and {len(rows) - 80} more")
+    _ = db  # keep wrapper warm
+    await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: viral handle / viral seed example commands
+# ---------------------------------------------------------------------------
+
+
+@restricted
+async def cmd_viral_handles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = _db_wrapper(context)
+    handles = sorted(await db.get_viral_handles())
+    if not handles:
+        await _reply(update, "No viral handles yet.")
+        return
+    body = ", ".join(f"@{h}" for h in handles)
+    await _reply(update, f"Known builder handles ({len(handles)}): {body}")
+
+
+@restricted
+async def cmd_viral_handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if len(args) < 2 or args[0].lower() not in ("add", "remove"):
+        await _reply(update, "Usage: /viral_handle add|remove <handle>")
+        return
+    action = args[0].lower()
+    handle = args[1].lstrip("@").lower().strip()
+    if not handle:
+        await _reply(update, "Handle is empty.")
+        return
+    db = _db_wrapper(context)
+    if action == "add":
+        ok = await db.add_viral_handle(handle, source="user_added")
+        await _reply(
+            update,
+            f"Added @{handle}." if ok else f"@{handle} already on list.",
+        )
+    else:
+        ok = await db.remove_viral_handle(handle)
+        await _reply(
+            update,
+            f"Removed @{handle}." if ok else f"@{handle} was not on the list.",
+        )
+
+
+@restricted
+async def cmd_seed_viral_example(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    args = context.args or []
+    db = _db_wrapper(context)
+    if not args or args[0].lower() != "add":
+        examples = await db.get_viral_seed_examples()
+        if not examples:
+            await _reply(update, "No viral seed examples yet.")
+            return
+        recent = examples[-3:]
+        lines = [f"<b>Viral seed examples (last {len(recent)} of {len(examples)})</b>"]
+        for e in recent:
+            lines.append("")
+            lines.append(f"<b>{html.escape(e['name'])}</b> ({html.escape(e['chain'])})")
+            sigs = ", ".join(e.get("signals", []))
+            lines.append(f"signals: {html.escape(sigs)}")
+            lines.append(f"<i>{html.escape(e.get('rationale','')[:300])}</i>")
+        await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+    payload = " ".join(args[1:]).strip()
+    if not payload:
+        await _reply(
+            update,
+            'Usage: /seed_viral_example add {"name": "...", "chain": "...", '
+            '"signals": [...], "phrases": [...], "handles": [...], '
+            '"rationale": "..."}',
+        )
+        return
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as e:
+        await _reply(update, f"Invalid JSON: {e}")
+        return
+    name = data.get("name")
+    chain = data.get("chain")
+    if not name or not chain:
+        await _reply(update, "Required fields: name, chain.")
+        return
+    added = await db.add_viral_seed_example(
+        name=name, chain=chain,
+        window_start=data.get("window_start"),
+        window_end=data.get("window_end"),
+        signals=data.get("signals", []),
+        phrases=data.get("phrases", []),
+        handles=data.get("handles", []),
+        rationale=data.get("rationale", ""),
+    )
+    await _reply(
+        update,
+        f"Added viral seed example '{name}'." if added else f"'{name}' already exists.",
+    )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("handler_error", exc_info=context.error)
 
@@ -657,6 +1029,21 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("learnings", cmd_learnings))
+    app.add_handler(CommandHandler("sectors", cmd_sectors))
+    app.add_handler(CommandHandler("venues", cmd_venues))
+    app.add_handler(CommandHandler("mechanisms", cmd_mechanisms))
+    app.add_handler(CommandHandler("sector", cmd_sector))
+    app.add_handler(CommandHandler("venue", cmd_venue))
+    app.add_handler(CommandHandler("mechanism", cmd_mechanism))
+    app.add_handler(CommandHandler("convergence", cmd_convergence))
+    app.add_handler(CommandHandler("convergence_threshold", cmd_convergence_threshold))
+    app.add_handler(CommandHandler("strong_convergence", cmd_strong_convergence))
+    app.add_handler(CommandHandler("strong_threshold", cmd_strong_threshold))
+    app.add_handler(CommandHandler("emerging", cmd_emerging))
+    app.add_handler(CommandHandler("viral_handles", cmd_viral_handles))
+    app.add_handler(CommandHandler("viral_handle", cmd_viral_handle))
+    app.add_handler(CommandHandler("seed_viral_example", cmd_seed_viral_example))
+    app.add_handler(CallbackQueryHandler(on_venue_suggestion_callback, pattern=r"^s_v:"))
     app.add_handler(CallbackQueryHandler(on_suggestion_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(on_feedback_callback, pattern=r"^[udm]:"))
     for name in COMING_SOON_COMMANDS:
