@@ -1,4 +1,4 @@
-"""Tests for the /run and /preview rate-limit gating."""
+"""Tests for the /run rate-limit gating."""
 from datetime import UTC, datetime, timedelta
 
 import pytest

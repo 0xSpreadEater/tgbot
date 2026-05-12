@@ -3,6 +3,7 @@ import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 import aiosqlite
 
@@ -307,3 +308,196 @@ class Db:
             (tweet_id, topic_name, author_handle.lower(), label, tweet_text, metrics_json),
         )
         await self.conn.commit()
+
+    async def upsert_pending_feedback(
+        self,
+        *,
+        tweet_id: str,
+        author_handle: str,
+        tweet_text: str,
+        topic_name: str | None,
+        metrics_json: str,
+    ) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO pending_feedback("
+            "tweet_id, author_handle, tweet_text, topic_name, metrics_json"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (tweet_id, author_handle.lower(), tweet_text, topic_name, metrics_json),
+        )
+        await self.conn.commit()
+
+    async def get_pending_feedback(self, tweet_id: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT tweet_id, author_handle, tweet_text, topic_name, metrics_json "
+            "FROM pending_feedback WHERE tweet_id = ?",
+            (tweet_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return {
+            "tweet_id": row["tweet_id"],
+            "author_handle": row["author_handle"],
+            "tweet_text": row["tweet_text"],
+            "topic_name": row["topic_name"],
+            "metrics_json": row["metrics_json"],
+        }
+
+    async def get_feedback(self, tweet_id: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT tweet_id, topic_name, author_handle, label, tweet_text, tweet_metrics_json "
+            "FROM feedback WHERE tweet_id = ?",
+            (tweet_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return {
+            "tweet_id": row["tweet_id"],
+            "topic_name": row["topic_name"],
+            "author_handle": row["author_handle"],
+            "label": row["label"],
+            "tweet_text": row["tweet_text"],
+            "tweet_metrics_json": row["tweet_metrics_json"],
+        }
+
+    async def upsert_feedback(
+        self,
+        *,
+        tweet_id: str,
+        topic_name: str | None,
+        author_handle: str,
+        label: str,
+        tweet_text: str,
+        tweet_metrics_json: str | None = None,
+    ) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO feedback("
+            "tweet_id, topic_name, author_handle, label, tweet_text, tweet_metrics_json"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (tweet_id, topic_name, author_handle.lower(), label, tweet_text, tweet_metrics_json),
+        )
+        await self.conn.commit()
+
+    async def adjust_author_score(
+        self,
+        handle: str,
+        prior_label: str | None,
+        new_label: str,
+    ) -> None:
+        """Diff the author_scores counters between prior and new label.
+
+        Only up/down affect counters; mute is tracked via muted_until separately.
+        """
+        h = handle.lower()
+        d_up = 0
+        d_down = 0
+        if prior_label == "up":
+            d_up -= 1
+        elif prior_label == "down":
+            d_down -= 1
+        if new_label == "up":
+            d_up += 1
+        elif new_label == "down":
+            d_down += 1
+
+        now_iso = datetime.utcnow().isoformat()
+        await self.conn.execute(
+            "INSERT INTO author_scores(handle, ups, downs, last_up_at, last_down_at) "
+            "VALUES(?, 0, 0, NULL, NULL) "
+            "ON CONFLICT(handle) DO NOTHING",
+            (h,),
+        )
+        await self.conn.execute(
+            "UPDATE author_scores SET "
+            "ups = MAX(0, ups + ?), "
+            "downs = MAX(0, downs + ?), "
+            "last_up_at = CASE WHEN ? = 'up' THEN ? ELSE last_up_at END, "
+            "last_down_at = CASE WHEN ? = 'down' THEN ? ELSE last_down_at END "
+            "WHERE handle = ?",
+            (d_up, d_down, new_label, now_iso, new_label, now_iso, h),
+        )
+        await self.conn.commit()
+
+    async def set_author_muted(self, handle: str, until: datetime) -> None:
+        h = handle.lower()
+        until_iso = until.isoformat()
+        await self.conn.execute(
+            "INSERT INTO author_scores(handle, ups, downs, muted_until) VALUES(?, 0, 0, ?) "
+            "ON CONFLICT(handle) DO UPDATE SET muted_until = excluded.muted_until",
+            (h, until_iso),
+        )
+        await self.conn.commit()
+
+    async def clear_author_muted(self, handle: str) -> bool:
+        h = handle.lower()
+        cur = await self.conn.execute(
+            "UPDATE author_scores SET muted_until = NULL WHERE handle = ?",
+            (h,),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def get_recent_author_score(self, handle: str, days: int) -> tuple[int, int]:
+        return await self.get_author_feedback_counts(handle, days=days)
+
+    async def is_allowlisted(self, handle: str) -> bool:
+        async with self.conn.execute(
+            "SELECT 1 FROM allowlist WHERE handle = ?",
+            (handle.lower(),),
+        ) as cur:
+            row = await cur.fetchone()
+        return row is not None
+
+    async def add_to_allowlist(self, handle: str) -> bool:
+        cur = await self.conn.execute(
+            "INSERT OR IGNORE INTO allowlist(handle) VALUES(?)",
+            (handle.lower(),),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def is_suggestion_blocked(self, handle: str) -> bool:
+        async with self.conn.execute(
+            "SELECT 1 FROM suggestion_blocks WHERE handle = ?",
+            (handle.lower(),),
+        ) as cur:
+            row = await cur.fetchone()
+        return row is not None
+
+    async def add_suggestion_block(self, handle: str) -> None:
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO suggestion_blocks(handle) VALUES(?)",
+            (handle.lower(),),
+        )
+        await self.conn.commit()
+
+    async def top_authors_by_ups(self, days: int = 60, limit: int = 10) -> list[tuple[str, int, int]]:
+        days_clause = f"-{int(days)} days"
+        sql = (
+            "SELECT author_handle, "
+            "  SUM(CASE WHEN label='up' THEN 1 ELSE 0 END) AS ups, "
+            "  SUM(CASE WHEN label='down' THEN 1 ELSE 0 END) AS downs "
+            "FROM feedback WHERE created_at >= datetime('now', ?) "
+            "GROUP BY author_handle HAVING ups > 0 "
+            "ORDER BY ups DESC, downs ASC LIMIT ?"
+        )
+        async with self.conn.execute(sql, (days_clause, int(limit))) as cur:
+            rows = await cur.fetchall()
+        return [(r["author_handle"], int(r["ups"] or 0), int(r["downs"] or 0)) for r in rows]
+
+    async def bottom_authors_by_downs(
+        self, days: int = 60, limit: int = 10
+    ) -> list[tuple[str, int, int]]:
+        days_clause = f"-{int(days)} days"
+        sql = (
+            "SELECT author_handle, "
+            "  SUM(CASE WHEN label='up' THEN 1 ELSE 0 END) AS ups, "
+            "  SUM(CASE WHEN label='down' THEN 1 ELSE 0 END) AS downs "
+            "FROM feedback WHERE created_at >= datetime('now', ?) "
+            "GROUP BY author_handle HAVING downs > 0 "
+            "ORDER BY downs DESC, ups ASC LIMIT ?"
+        )
+        async with self.conn.execute(sql, (days_clause, int(limit))) as cur:
+            rows = await cur.fetchall()
+        return [(r["author_handle"], int(r["ups"] or 0), int(r["downs"] or 0)) for r in rows]

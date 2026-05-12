@@ -2,17 +2,18 @@ import hashlib
 import html
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bebop_bot import db as dbm
 from bebop_bot import pipeline as pipelinem
 from bebop_bot.auth import restricted
 from bebop_bot.digest import relative_time
+from bebop_bot.feedback import on_feedback_callback, on_suggestion_callback
 from bebop_bot.query_parser import normalize
 
 RATE_LIMIT_SECONDS = 60 * 60
@@ -31,25 +32,25 @@ HELP_TEXT = (
     "/test &lt;query&gt; — fetch 5 most recent (no scoring, no save)\n"
     "\n"
     "<b>Roundup</b>\n"
-    "/run — run roundup now (rate-limited 1/hr)\n"
-    "/preview — same as /run but does not advance since_id\n"
-    "/pause — pause the roundup\n"
-    "/resume — resume the roundup\n"
-    "/status — show bot status\n"
+    "/scan — manual force scan (no rate limit, ignores /pause)\n"
+    "/run — manual scan (60-min rate limit, respects /pause)\n"
+    "/pause — stop scheduled cycles (Phase 5)\n"
+    "/resume — resume scheduled cycles\n"
+    "/status — bot health\n"
     "\n"
     "<b>Filtering</b>\n"
     "/threshold &lt;n&gt; — set roundup threshold (1..5)\n"
     "/rubric — show, /rubric set &lt;text&gt;, /rubric clear\n"
-    "/learnings — (coming soon)\n"
+    "/learnings — summarize patterns from recent feedback\n"
     "/calibrate &lt;score&gt; | &lt;tweet text&gt; — label a manual example\n"
     "\n"
     "<b>Authors</b>\n"
     "/allow &lt;handle&gt; — add to allowlist\n"
     "/disallow &lt;handle&gt; — remove from allowlist\n"
     "/allowlist — show allowlist\n"
-    "/authors — (coming soon)\n"
-    "/mute &lt;handle&gt; — (coming soon)\n"
-    "/unmute &lt;handle&gt; — (coming soon)\n"
+    "/authors — top/bottom authors (60d)\n"
+    "/mute &lt;handle&gt; [days] — mute author (default 30)\n"
+    "/unmute &lt;handle&gt; — clear muted_until\n"
     "\n"
     "<b>Emerging</b>\n"
     "/chains — (coming soon)\n"
@@ -328,8 +329,7 @@ def _make_coming_soon(name: str):
 
 
 COMING_SOON_COMMANDS: tuple[str, ...] = (
-    "learnings",
-    "authors", "mute", "unmute", "chains", "sol_config", "evm_config",
+    "chains", "sol_config", "evm_config",
     "emerging", "dismiss", "sectors", "venues", "sector", "venue",
     "backfill",
 )
@@ -366,24 +366,28 @@ def _format_rate_limit_remaining(seconds: int) -> str:
     return f"Next /run available in {m}m {s}s."
 
 
-async def _run_pipeline(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    advance_since_id: bool,
-) -> None:
-    settings = context.application.bot_data["settings"]
+async def _ensure_pipeline_clients(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[object, object, dbm.Db] | None:
     x_client = context.application.bot_data.get("x_client")
     claude_client = context.application.bot_data.get("claude_client")
     if x_client is None or claude_client is None:
         await _reply(update, "Roundup is not configured. Set X_BEARER_TOKEN and ANTHROPIC_API_KEY.")
-        return
+        return None
+    return x_client, claude_client, _db_wrapper(context)
 
-    db = _db_wrapper(context)
+
+@restricted
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clients = await _ensure_pipeline_clients(update, context)
+    if clients is None:
+        return
+    x_client, claude_client, db = clients
     remaining = await _check_and_set_rate_limit(db)
     if remaining is not None:
         await _reply(update, _format_rate_limit_remaining(remaining))
         return
-
+    settings = context.application.bot_data["settings"]
     await _reply(update, "Running roundup…")
     await pipelinem.run_roundup(
         db=db,
@@ -391,18 +395,35 @@ async def _run_pipeline(
         claude=claude_client,
         bot=context.bot,
         chat_id=settings.telegram_user_id,
-        advance_since_id=advance_since_id,
+        advance_since_id=True,
+        force=False,
+        manual_scan=False,
     )
 
 
 @restricted
-async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _run_pipeline(update, context, advance_since_id=True)
-
-
-@restricted
-async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _run_pipeline(update, context, advance_since_id=False)
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clients = await _ensure_pipeline_clients(update, context)
+    if clients is None:
+        return
+    x_client, claude_client, db = clients
+    settings = context.application.bot_data["settings"]
+    chat_id = update.effective_chat.id if update.effective_chat else settings.telegram_user_id
+    await _reply(update, "Running manual scan...")
+    try:
+        await pipelinem.run_roundup(
+            db=db,
+            x=x_client,
+            claude=claude_client,
+            bot=context.bot,
+            chat_id=chat_id,
+            advance_since_id=True,
+            force=True,
+            manual_scan=True,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("scan_failed")
+        await _reply(update, "Scan failed - check logs.")
 
 
 @restricted
@@ -509,6 +530,105 @@ async def cmd_calibrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply(update, f"Recorded as '{label}'.")
 
 
+@restricted
+async def cmd_authors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db = _db_wrapper(context)
+    top = await db.top_authors_by_ups(days=60, limit=10)
+    bottom = await db.bottom_authors_by_downs(days=60, limit=10)
+    allowlist = await db.get_allowlist()
+
+    lines = ["<b>Top authors (60d)</b>"]
+    if not top:
+        lines.append("(no upvotes yet)")
+    else:
+        for handle, ups, downs in top:
+            trusted = handle in allowlist or (ups >= 3 and downs == 0)
+            marker = "  * (auto-include trusted)" if trusted else ""
+            lines.append(f"@{handle}   {ups}/{downs}{marker}")
+
+    lines.append("")
+    lines.append("<b>Bottom authors (60d)</b>")
+    if not bottom:
+        lines.append("(no downvotes yet)")
+    else:
+        for handle, ups, downs in bottom:
+            net = ups - downs
+            marker = "  (auto-hidden)" if net <= -3 else ""
+            lines.append(f"@{handle}   {ups}/{downs}{marker}")
+
+    await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@restricted
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        await _reply(update, "Usage: /mute <handle> [days]")
+        return
+    handle = args[0].lstrip("@").lower().strip()
+    if not handle:
+        await _reply(update, "Handle is empty.")
+        return
+    days = 30
+    if len(args) >= 2:
+        try:
+            days = int(args[1])
+        except ValueError:
+            await _reply(update, "Days must be an integer.")
+            return
+        if days <= 0:
+            await _reply(update, "Days must be positive.")
+            return
+    until = datetime.now(UTC) + timedelta(days=days)
+    db = _db_wrapper(context)
+    await db.set_author_muted(handle, until)
+    await _reply(update, f"Muted @{handle} for {days} days.")
+
+
+@restricted
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        await _reply(update, "Usage: /unmute <handle>")
+        return
+    handle = args[0].lstrip("@").lower().strip()
+    if not handle:
+        await _reply(update, "Handle is empty.")
+        return
+    db = _db_wrapper(context)
+    changed = await db.clear_author_muted(handle)
+    if changed:
+        await _reply(update, f"Unmuted @{handle}.")
+    else:
+        await _reply(update, f"@{handle} was not muted.")
+
+
+@restricted
+async def cmd_learnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    claude_client = context.application.bot_data.get("claude_client")
+    if claude_client is None:
+        await _reply(update, "Claude not configured. Set ANTHROPIC_API_KEY.")
+        return
+    db = _db_wrapper(context)
+    ups = await db.get_recent_feedback("up", 50)
+    downs = await db.get_recent_feedback("down", 50)
+    rubric = await db.get_setting("taste_rubric", "") or ""
+    if not ups and not downs:
+        await _reply(update, "No feedback yet. Use the reaction buttons or /calibrate first.")
+        return
+    await _reply(update, "Summarizing learnings…")
+    try:
+        text = await claude_client.summarize_learnings(ups, downs, rubric)
+    except Exception:  # noqa: BLE001
+        log.exception("learnings_failed")
+        await _reply(update, "Could not produce learnings - check logs.")
+        return
+    if not text.strip():
+        await _reply(update, "Got an empty response from Claude.")
+        return
+    await _reply(update, text)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("handler_error", exc_info=context.error)
 
@@ -529,10 +649,16 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
-    app.add_handler(CommandHandler("preview", cmd_preview))
+    app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("rubric", cmd_rubric))
     app.add_handler(CommandHandler("calibrate", cmd_calibrate))
+    app.add_handler(CommandHandler("authors", cmd_authors))
+    app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_handler(CommandHandler("learnings", cmd_learnings))
+    app.add_handler(CallbackQueryHandler(on_suggestion_callback, pattern=r"^s:"))
+    app.add_handler(CallbackQueryHandler(on_feedback_callback, pattern=r"^[udm]:"))
     for name in COMING_SOON_COMMANDS:
         app.add_handler(CommandHandler(name, _make_coming_soon(name)))
     app.add_error_handler(error_handler)
