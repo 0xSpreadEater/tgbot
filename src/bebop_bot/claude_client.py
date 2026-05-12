@@ -101,6 +101,14 @@ class ClaudeClient:
         if taste_rubric and taste_rubric.strip():
             system_prompt += "\n\nAdditional user-specified taste guidance:\n" + taste_rubric.strip()
 
+        log.debug(
+            "claude_score_few_shot",
+            extra={
+                "topic": topic_name,
+                "few_shot_ups": len(few_shot_ups or []),
+                "few_shot_downs": len(few_shot_downs or []),
+            },
+        )
         calibration = ""
         if few_shot_ups or few_shot_downs:
             calibration = "Calibration examples from the user's past feedback:\n"
@@ -212,8 +220,43 @@ class ClaudeClient:
     async def propose_dictionary_terms(self, *args, **kwargs):
         raise NotImplementedError("propose_dictionary_terms is added in Phase 4")
 
-    async def summarize_learnings(self, *args, **kwargs):
-        raise NotImplementedError("summarize_learnings is added in Phase 3")
+    async def summarize_learnings(
+        self,
+        ups: list[Any],
+        downs: list[Any],
+        current_rubric: str,
+    ) -> str:
+        system = (
+            "Summarize patterns in the user's curation choices. 4-6 sentences. "
+            "Focus on what they reward and reject. If the current rubric is non-empty, "
+            "note where new evidence aligns or conflicts."
+        )
+
+        def _fmt(examples: list[Any]) -> str:
+            lines = []
+            for i, ex in enumerate(examples, start=1):
+                lines.append(f"{i}. {_ex_text(ex)} - by @{_ex_handle(ex)}")
+            return "\n".join(lines) if lines else "(none)"
+
+        rubric_block = current_rubric.strip() or "(empty)"
+        user_msg = (
+            f"Current taste rubric:\n{rubric_block}\n\n"
+            f"Recent ups ({len(ups)}):\n{_fmt(ups)}\n\n"
+            f"Recent downs ({len(downs)}):\n{_fmt(downs)}"
+        )
+        try:
+            resp = await self._client.messages.create(
+                model=self.model,
+                max_tokens=600,
+                system=system,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            return "".join(
+                block.text for block in resp.content if getattr(block, "type", None) == "text"
+            ).strip()
+        except Exception as e:  # noqa: BLE001
+            log.exception("claude_learnings_error", extra={"error": str(e)})
+            return ""
 
 
 def _neutral_score(t: Tweet) -> TweetScore:

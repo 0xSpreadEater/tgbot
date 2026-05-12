@@ -17,10 +17,12 @@ async def run_roundup(
     bot: Any,
     chat_id: int,
     advance_since_id: bool = True,
+    force: bool = False,
+    manual_scan: bool = False,
 ) -> dict[str, tuple[str, list[ScoredTweet]]]:
     results: dict[str, tuple[str, list[ScoredTweet]]] = {}
     try:
-        if await db.is_paused():
+        if not force and await db.is_paused():
             log.info("roundup_skipped_paused")
             return {}
 
@@ -90,7 +92,9 @@ async def run_roundup(
             )
             results[topic.name] = (summary, scored)
 
-        await digest.send_digest(bot, chat_id, results)
+        await digest.send_digest(
+            bot, chat_id, results, db=db, manual_scan=manual_scan,
+        )
         await db.set_setting("last_run_at", datetime.now(UTC).isoformat())
         log.info(
             "roundup_done",

@@ -52,8 +52,9 @@ def test_post_truncation():
     long = "x" * 1000
     st = make_scored(text=long)
     out = _format_post(st, datetime.now(UTC))
-    # body trimmed to <=280 chars including ellipsis
-    assert "x" * 280 not in out  # full 1000 not present
+    # body trimmed to <=320 chars including ellipsis
+    assert "x" * 1000 not in out
+    assert "x" * 320 not in out
     assert "…" in out
 
 
@@ -77,8 +78,20 @@ class FakeBot:
     def __init__(self):
         self.sent = []
 
-    async def send_message(self, chat_id, text, parse_mode=None, disable_web_page_preview=None):
-        self.sent.append({"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+    async def send_message(
+        self,
+        chat_id,
+        text,
+        parse_mode=None,
+        disable_web_page_preview=None,
+        reply_markup=None,
+    ):
+        self.sent.append({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "reply_markup": reply_markup,
+        })
 
 
 async def test_send_digest_empty_results():

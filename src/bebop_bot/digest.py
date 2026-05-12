@@ -1,8 +1,10 @@
 import html
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 
 from bebop_bot.models import ScoredTweet
@@ -10,7 +12,7 @@ from bebop_bot.models import ScoredTweet
 log = logging.getLogger(__name__)
 
 TELEGRAM_MAX = 4000
-POST_TEXT_LIMIT = 280
+POST_TEXT_LIMIT = 320
 
 
 def relative_time(dt: datetime, now: datetime | None = None) -> str:
@@ -40,24 +42,24 @@ def _format_post(st: ScoredTweet, now: datetime) -> str:
     composite = st.score.composite
     likes = t.like_count
     replies = t.reply_count
+    retweets = t.retweet_count
     rel = relative_time(t.created_at, now=now)
     text = t.text
     if len(text) > POST_TEXT_LIMIT:
         text = text[: POST_TEXT_LIMIT - 1] + "…"
     body = html.escape(text)
-    reason = ""
-    if st.auto_included_reason:
-        reason = f" [{html.escape(st.auto_included_reason)}]"
+    auto_marker = " *" if st.auto_included_reason else ""
     return (
-        f'• <a href="{url}">@{handle}</a> score {composite:.1f}{reason}\n'
-        f"  {likes}❤ {replies}\U0001f4ac {rel}\n"
-        f"  {body}"
+        f'<a href="{url}">@{handle}</a> score {composite:.1f}{auto_marker}\n'
+        f"{likes}❤ {replies}\U0001f4ac {retweets}\U0001f501 {rel}\n\n"
+        f"{body}"
     )
 
 
 def _format_topic_block(
     topic_name: str, summary: str, posts: list[ScoredTweet], now: datetime
 ) -> str:
+    """Kept for backwards compat with tests. Phase 3 sends per-post messages."""
     header = f"<b>{html.escape(topic_name)}</b> ({len(posts)})"
     parts = [header]
     if summary:
@@ -82,7 +84,19 @@ def _split_messages(header: str, blocks: list[str]) -> list[str]:
     return messages
 
 
-async def _send(bot: Any, chat_id: int, text: str) -> None:
+def _post_keyboard(tweet_id: str, handle: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Insight", callback_data=f"u:{tweet_id}"),
+                InlineKeyboardButton("Noise", callback_data=f"d:{tweet_id}"),
+                InlineKeyboardButton(f"Mute @{handle} 30d", callback_data=f"m:{tweet_id}"),
+            ]
+        ]
+    )
+
+
+async def _send_plain(bot: Any, chat_id: int, text: str) -> None:
     await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -91,27 +105,74 @@ async def _send(bot: Any, chat_id: int, text: str) -> None:
     )
 
 
+async def _send_post(
+    bot: Any,
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
+
+
 async def send_digest(
     bot: Any,
     chat_id: int,
     results: dict[str, tuple[str, list[ScoredTweet]]],
+    db: Any = None,
+    manual_scan: bool = False,
 ) -> None:
     now = datetime.now(UTC)
     ts = now.strftime("%Y-%m-%d %H:%M UTC")
+    header_title = "Manual scan" if manual_scan else "Roundup"
 
     if not results:
-        await _send(bot, chat_id, f"<b>Roundup - {ts}</b>\nNo posts cleared the threshold.")
+        await _send_plain(
+            bot, chat_id,
+            f"<b>{header_title} - {ts}</b>\nNo posts cleared the threshold.",
+        )
         return
 
     total = sum(len(posts) for _, posts in results.values())
     n_topics = len(results)
-    header = f"<b>Roundup - {ts}</b>\n{n_topics} topics, {total} posts"
+    header = (
+        f"<b>{header_title} - {ts}</b>\n"
+        f"{n_topics} topics, {total} posts surfaced"
+    )
+    await _send_plain(bot, chat_id, header)
 
-    blocks = [
-        _format_topic_block(name, summary, posts, now)
-        for name, (summary, posts) in results.items()
-        if posts
-    ]
+    for topic_name, (summary, posts) in results.items():
+        if not posts:
+            continue
+        topic_header = f"<b>=== {html.escape(topic_name)} ===</b>"
+        if summary:
+            topic_header += f"\n<i>{html.escape(summary)}</i>"
+        await _send_plain(bot, chat_id, topic_header)
 
-    for msg in _split_messages(header, blocks):
-        await _send(bot, chat_id, msg)
+        for st in posts:
+            t = st.tweet
+            body = _format_post(st, now)
+            metrics = {
+                "likes": t.like_count,
+                "replies": t.reply_count,
+                "retweets": t.retweet_count,
+                "quotes": t.quote_count,
+            }
+            if db is not None:
+                try:
+                    await db.upsert_pending_feedback(
+                        tweet_id=t.id,
+                        author_handle=t.author_handle,
+                        tweet_text=t.text,
+                        topic_name=topic_name,
+                        metrics_json=json.dumps(metrics),
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("pending_feedback_insert_failed", extra={"tweet_id": t.id})
+            kb = _post_keyboard(t.id, t.author_handle)
+            await _send_post(bot, chat_id, body, kb)
