@@ -14,6 +14,7 @@ from bebop_bot import db as dbm
 from bebop_bot import dictionary as dictm
 from bebop_bot import pipeline as pipelinem
 from bebop_bot.auth import restricted
+from bebop_bot.backfill import cmd_backfill
 from bebop_bot.digest import relative_time
 from bebop_bot.feedback import (
     on_feedback_callback,
@@ -85,7 +86,9 @@ HELP_TEXT = (
     "/seed_viral_example add &lt;json&gt; — append a viral seed\n"
     "\n"
     "<b>Backfill</b>\n"
-    "/backfill — (coming soon)\n"
+    "/backfill — historical sweep to seed baselines (default 14d)\n"
+    "/backfill --force — re-run within the 30-day cooldown\n"
+    "/backfill --days N — override the window (1..30)\n"
     "\n"
     "<b>Meta</b>\n"
     "/help — this message\n"
@@ -363,7 +366,7 @@ def _make_coming_soon(name: str):
 
 
 COMING_SOON_COMMANDS: tuple[str, ...] = (
-    "chains", "sol_config", "evm_config", "dismiss", "backfill",
+    "chains", "sol_config", "evm_config", "dismiss",
 )
 
 
@@ -1043,6 +1046,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("viral_handles", cmd_viral_handles))
     app.add_handler(CommandHandler("viral_handle", cmd_viral_handle))
     app.add_handler(CommandHandler("seed_viral_example", cmd_seed_viral_example))
+    app.add_handler(CommandHandler("backfill", cmd_backfill))
     app.add_handler(CallbackQueryHandler(on_venue_suggestion_callback, pattern=r"^s_v:"))
     app.add_handler(CallbackQueryHandler(on_suggestion_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(on_feedback_callback, pattern=r"^[udm]:"))

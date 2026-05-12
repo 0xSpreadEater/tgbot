@@ -913,6 +913,47 @@ class Db:
         )
         await self.conn.commit()
 
+    async def upsert_entity_mention(
+        self,
+        *,
+        entity_type: str,
+        entity_term: str,
+        cycle_ts: datetime,
+        weighted_count: float,
+        raw_count: int,
+        unique_authors: int,
+    ) -> None:
+        await self.insert_entity_mention(
+            entity_type=entity_type,
+            entity_term=entity_term,
+            cycle_ts=cycle_ts,
+            weighted_count=weighted_count,
+            raw_count=raw_count,
+            unique_authors=unique_authors,
+        )
+
+    async def upsert_token_mention(
+        self,
+        *,
+        token: str,
+        chain: str,
+        cycle_ts: datetime,
+        weighted_count: float,
+        raw_count: int,
+        unique_authors_count: int,
+    ) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO token_mentions("
+            "token, chain, cycle_ts, weighted_count, raw_count, unique_authors_count) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                token, chain,
+                cycle_ts.isoformat() if isinstance(cycle_ts, datetime) else cycle_ts,
+                weighted_count, raw_count, unique_authors_count,
+            ),
+        )
+        await self.conn.commit()
+
     async def get_entity_first_seen(self, entity_type: str, entity_term: str) -> str | None:
         async with self.conn.execute(
             "SELECT MIN(cycle_ts) AS m FROM entity_mentions "
