@@ -57,7 +57,7 @@ async def run_roundup(
             except Exception as e:  # noqa: BLE001
                 log.exception(
                     "topic_fetch_error",
-                    extra={"name": topic.name, "error": str(e)},
+                    extra={"topic": topic.name, "error": str(e)},
                 )
                 continue
 
@@ -79,7 +79,7 @@ async def run_roundup(
             log.info(
                 "topic_processed",
                 extra={
-                    "name": topic.name,
+                    "topic": topic.name,
                     "raw": len(raw),
                     "after_filter": len(scored),
                 },
