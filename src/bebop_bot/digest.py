@@ -141,6 +141,9 @@ async def send_convergence_block(
                 f"{conf_str}{e.get('signal_count', 0)}/7 signals"
             )
             lines.append(f"<i>{html.escape(str(e.get('summary','')))}</i>")
+            top_url = e.get("top_tweet_url")
+            if top_url:
+                lines.append(f'▸ <a href="{html.escape(str(top_url), quote=True)}">top tweet</a>')
         await _send_plain(bot, chat_id, "\n".join(lines))
 
     if normal:
@@ -153,6 +156,9 @@ async def send_convergence_block(
                 f"{e.get('signal_count', 0)}/7 signals"
             )
             lines.append(f"<i>{html.escape(str(e.get('summary','')))}</i>")
+            top_url = e.get("top_tweet_url")
+            if top_url:
+                lines.append(f'▸ <a href="{html.escape(str(top_url), quote=True)}">top tweet</a>')
         await _send_plain(bot, chat_id, "\n".join(lines))
 
 
@@ -205,6 +211,11 @@ async def send_emerging_track(
         partner_line = _cooc_partner_line(cooc_graph or {}, entity_type, term)
         if partner_line:
             lines.append(partner_line)
+        top_url = getattr(e, "top_tweet_url", None)
+        if top_url:
+            lines.append(
+                f'▸ <a href="{html.escape(str(top_url), quote=True)}">top tweet</a>'
+            )
     await _send_plain(bot, chat_id, "\n".join(lines))
 
 
@@ -314,10 +325,13 @@ async def send_digest(
 
     total = sum(len(posts) for _, posts in results.values())
     n_topics = len(results)
-    header = (
-        f"<b>{header_title} - {ts}</b>\n"
-        f"{n_topics} topics, {total} posts surfaced"
-    )
+    if has_results:
+        header = (
+            f"<b>{header_title} - {ts}</b>\n"
+            f"{n_topics} topics, {total} posts surfaced"
+        )
+    else:
+        header = f"<b>{header_title} - {ts}</b>"
     await _send_plain(bot, chat_id, header)
 
     if emerging:

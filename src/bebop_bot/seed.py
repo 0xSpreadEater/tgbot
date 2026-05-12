@@ -436,8 +436,8 @@ async def seed_viral_examples(conn: aiosqlite.Connection) -> int:
         })
         cur = await conn.execute(
             "INSERT OR IGNORE INTO viral_seed_examples("
-            "name, chain, window_start, window_end, signals_json, rationale) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
+            "name, chain, window_start, window_end, signals_json, rationale, source) "
+            "VALUES(?, ?, ?, ?, ?, ?, 'seed')",
             (
                 entry["name"], entry["chain"],
                 entry.get("window_start"), entry.get("window_end"),
