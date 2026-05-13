@@ -349,15 +349,25 @@ class ClaudeClient:
         evidence: dict,
         viral_seeds: list[dict],
         sample_tweets: list[Tweet],
+        pattern_corpus: list[dict] | None = None,
     ) -> dict:
         """Ask Claude to score how strongly this entity resembles known viral
-        precursors. Returns {'confidence': 1-5, 'rationale': str}."""
+        precursors. Returns {'confidence': 1-5, 'rationale': str}.
+
+        pattern_corpus (Phase 4.7) is an optional list of named observational
+        patterns Claude previously proposed and the user has curated. When
+        supplied, it's added as an additional few-shot block and Claude is
+        asked to call out any pattern from the corpus that applies to the
+        candidate.
+        """
+        pattern_corpus = pattern_corpus or []
         system = (
             "You are evaluating whether a crypto entity is showing precursor "
-            "signals to a viral run. You have a list of historical positive "
-            "examples (tokens / sectors / venues / mechanisms that ACTUALLY "
-            "went viral within 7-14 days of these signals being visible), and "
-            "a fresh candidate with which signals fired and what evidence "
+            "signals to a viral run. You have:\n"
+            "  - Calibration examples (historical viral-token precursors)\n"
+            "  - Pattern corpus (named observational patterns the bot has "
+            "accumulated; user-curated)\n"
+            "  - A fresh candidate with which signals fired and what evidence "
             "supports each.\n\n"
             "Output strict JSON:\n"
             '{"confidence": <1-5>, "rationale": "<1-2 sentences>"}\n\n'
@@ -368,6 +378,8 @@ class ClaudeClient:
             "  4 = pattern strongly resembles historical positives in this dataset\n"
             "  5 = textbook precursor pattern; high confidence this is an early "
             "viral candidate\n\n"
+            "If a pattern from the pattern corpus seems to apply to the "
+            "candidate, mention it by name in your rationale.\n\n"
             "Be CONSERVATIVE. False positives are cheaper than false negatives, "
             "but the user reads every 'strong convergence' message. Reserve 5 "
             "for patterns that line up with at least 2 historical positives "
@@ -398,10 +410,26 @@ class ClaudeClient:
             tweet_lines.append(f"  {i}. {text} - @{handle}")
         tweet_block = "\n".join(tweet_lines) if tweet_lines else "  (none)"
 
+        if pattern_corpus:
+            pattern_lines = []
+            for p in pattern_corpus[:15]:
+                weight = float(p.get("weight", 1.0) or 1.0)
+                pattern_lines.append(
+                    f"  - {p.get('name','?')} (weight {weight:.1f}): "
+                    f"{(p.get('description') or '')[:300]}"
+                )
+            pattern_block = (
+                "Pattern corpus (Claude-proposed, user-curated):\n"
+                + "\n".join(pattern_lines)
+            )
+        else:
+            pattern_block = "Pattern corpus: (none yet)"
+
         user = (
             f"Candidate entity: {entity_type}: {entity_term}\n\n"
             f"Signals fired ({len(signals_fired)}/7):\n{sig_block}\n\n"
             f"Historical positive examples for comparison:\n{seed_block}\n\n"
+            f"{pattern_block}\n\n"
             f"Recent tweets mentioning this entity:\n{tweet_block}\n"
         )
         log.debug(
@@ -411,6 +439,7 @@ class ClaudeClient:
                 "entity_term": entity_term,
                 "signals_fired_count": len(signals_fired),
                 "viral_seeds_count": len(viral_seeds),
+                "pattern_corpus_count": len(pattern_corpus),
                 "sample_tweets_count": len(sample_tweets),
                 "prompt_body": user[:4000],
             },
@@ -448,6 +477,158 @@ class ClaudeClient:
             confidence = None
         rationale = str(parsed.get("rationale", ""))[:600]
         return {"confidence": confidence, "rationale": rationale}
+
+    async def propose_patterns(
+        self,
+        sample: list[Tweet],
+        existing_patterns: list[dict],
+        cap: int,
+    ) -> list[dict]:
+        """Free-form pattern proposal (Phase 4.7).
+
+        Returns a list of dicts:
+          {'name': str, 'description': str, 'confidence': int 1-5,
+           'tweet_ids': list[str], 'anchors': list[(etype, eterm)]}
+
+        Each pattern must be a noun-phrase name (<=6 words), observed
+        across >=3 posts in the sample, distinct from the seven
+        structural categories the bot already detects, and distinct
+        from existing names. Empty list if nothing qualifies; the
+        method never raises.
+        """
+        if not sample or cap <= 0:
+            return []
+
+        existing_block = "\n".join(
+            f"  - {p.get('name','?')} (weight {float(p.get('weight',1.0) or 1.0):.1f}, "
+            f"proposed {int(p.get('propose_count',1) or 1)}x): "
+            f"{(p.get('description') or '')[:300]}"
+            for p in (existing_patterns or [])[:30]
+        ) or "(none yet)"
+
+        system = (
+            "You are scanning crypto Twitter for patterns that may signal "
+            "an emerging viral token or narrative — patterns BEYOND the "
+            "structural categories the bot already detects.\n\n"
+            "The bot already detects these seven structural signal "
+            "categories per post:\n"
+            "  1. novel mechanism vocabulary\n"
+            "  2. new venue + flagship-dApp coupling\n"
+            "  3. known pseudonymous builder\n"
+            "  4. recursive yield / composition language\n"
+            "  5. backing or legitimization moment\n"
+            "  6. builder + trader language same window\n"
+            "  7. fair-launch / bonding-curve mechanic\n\n"
+            "Your job is to identify patterns that DON'T fit cleanly into "
+            "any of those seven, but that look meaningful — for example: "
+            "VC-portfolio co-rallies, ecosystem token rotation patterns, "
+            "specific airdrop-eligibility hint language, geographic early-"
+            "adoption patterns, cross-token speculation correlations, "
+            "narrative-handoff patterns, etc.\n\n"
+            "Each pattern you propose must:\n"
+            "  - Have a SHORT noun-phrase name (max 6 words)\n"
+            "  - Be observed across multiple posts in the sample (>=3)\n"
+            "  - Be distinct from the seven structural categories\n"
+            "  - Be distinct from existing proposed patterns in the corpus "
+            "(case-insensitive name match)\n"
+            "  - Cite specific supporting tweet indices and anchor entities\n\n"
+            f"Be conservative. Propose at most {int(cap)} patterns this "
+            "cycle. Return zero if you don't see anything genuinely novel. "
+            "Don't manufacture filler to hit the cap.\n\n"
+            "Existing pattern corpus (do NOT re-propose under the same "
+            "name unless the sample strongly reinforces it):\n"
+            f"{existing_block}\n\n"
+            'Return strict JSON: {"patterns": [{"name": str, '
+            '"description": str (1 sentence), "confidence": int 1-5, '
+            '"tweet_indices": [int], "anchors": [{"type": str, '
+            '"term": str}]}, ...]} — empty list if nothing qualifies.'
+        )
+
+        sample_block = "\n".join(
+            f"{i + 1}. {(t.text or '')[:280]} - @{getattr(t,'author_handle','')}"
+            for i, t in enumerate(sample[:60])
+        )
+        user_msg = "Tweet sample:\n" + sample_block
+
+        log.debug(
+            "claude_propose_patterns_prompt",
+            extra={
+                "sample_size": len(sample),
+                "existing_pattern_count": len(existing_patterns or []),
+                "proposal_cap": int(cap),
+                "prompt_body": (system + "\n\n" + user_msg)[:4000],
+            },
+        )
+
+        try:
+            resp = await self._client.messages.create(
+                model=self.model,
+                max_tokens=800,
+                system=system,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = "".join(
+                block.text for block in resp.content
+                if getattr(block, "type", None) == "text"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "claude_propose_patterns_error",
+                extra={"error": str(e)},
+            )
+            return []
+
+        parsed = _extract_json(raw)
+        if not parsed:
+            log.warning(
+                "claude_propose_patterns_parse_fail",
+                extra={"raw_snippet": raw[:300]},
+            )
+            return []
+
+        items = parsed.get("patterns") or []
+        if not isinstance(items, list):
+            return []
+
+        out: list[dict] = []
+        for item in items[: int(cap)]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            desc = str(item.get("description") or "").strip()
+            if not name or not desc:
+                continue
+            try:
+                conf = max(1, min(5, int(item.get("confidence", 1))))
+            except (TypeError, ValueError):
+                conf = 1
+            try:
+                indices = [int(i) for i in (item.get("tweet_indices") or [])]
+            except (TypeError, ValueError):
+                indices = []
+            tweet_ids: list[str] = []
+            for i in indices:
+                if 1 <= i <= len(sample):
+                    tid = str(getattr(sample[i - 1], "id", "") or "")
+                    if tid:
+                        tweet_ids.append(tid)
+            anchors_raw = item.get("anchors") or []
+            anchors: list[tuple[str, str]] = []
+            if isinstance(anchors_raw, list):
+                for a in anchors_raw[:5]:
+                    if isinstance(a, dict):
+                        etype = str(a.get("type") or "").strip()
+                        eterm = str(a.get("term") or "").strip()
+                        if etype and eterm:
+                            anchors.append((etype, eterm))
+            out.append({
+                "name": name[:80],
+                "description": desc[:500],
+                "confidence": conf,
+                "tweet_ids": tweet_ids[:5],
+                "anchors": anchors,
+            })
+        return out
 
     async def summarize_learnings(
         self,
