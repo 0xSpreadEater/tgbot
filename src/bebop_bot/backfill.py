@@ -2,12 +2,12 @@
 
 On a fresh install the four-track emerging signals (tokens, sectors,
 venues, mechanisms) and the co-occurrence graph have no baseline. A
-single 14-day backfill walks the X recent-search window in 4h chunks
+single 7-day backfill walks the X recent-search window in 4h chunks
 and writes per-cycle aggregates so the very next /run produces
 meaningful momentum / coherence scores.
 
 Backfill intentionally skips convergence detection — convergence is a
-real-time signal and replaying it across ~84 historical cycles would
+real-time signal and replaying it across ~42 historical cycles would
 generate notification noise without value.
 """
 from __future__ import annotations
@@ -24,6 +24,9 @@ from bebop_bot import cooccurrence, extractors
 from bebop_bot.auth import restricted
 
 log = logging.getLogger(__name__)
+
+# X API Basic / pay-as-you-go tier only supports ~7 days of recent search.
+BACKFILL_DAYS = 7
 
 
 def now_utc() -> datetime:
@@ -82,16 +85,16 @@ async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if days is None:
-        raw = await db.get_setting("backfill_days", "14")
+        raw = await db.get_setting("backfill_days", str(BACKFILL_DAYS))
         try:
-            days = int(raw or "14")
+            days = int(raw or str(BACKFILL_DAYS))
         except ValueError:
-            days = 14
-    if days < 1 or days > 30:
+            days = BACKFILL_DAYS
+    if days < 1 or days > 7:
         await update.message.reply_text(
-            "Backfill window must be 1-30 days. (X recent search reaches "
-            "back ~7 days reliably; 14 is the recommended default; >14 may "
-            "have gaps for older windows.)"
+            "Backfill window must be 1-7 days. The X API Basic / "
+            "pay-as-you-go tier only supports ~7 days of recent search; "
+            "7 is the default."
         )
         return
 
@@ -116,7 +119,7 @@ async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text(
         f"Starting backfill ({days} days). Expect "
-        f"{int(3 + days * 0.3)}-{int(6 + days * 0.6)} minutes. "
+        f"{int(2 + days * 0.3)}-{int(2 + days * 0.5)} minutes. "
         f"Will DM progress."
     )
     asyncio.create_task(
@@ -133,9 +136,17 @@ async def run_backfill(
     days: int,
 ) -> None:
     start = now_utc()
+    total_tweets = 0
+    pause_count = 0
+    max_tweets = 4500
+    max_pauses = 3
     log.info(
         "backfill_started",
-        extra={"days_arg": days, "start_iso": start.isoformat()},
+        extra={
+            "backfill_days": days,
+            "max_tweets_cap": max_tweets,
+            "start_iso": start.isoformat(),
+        },
     )
     await bot.send_message(
         chat_id, f"Backfill: sweeping X for past {days} days..."
@@ -147,11 +158,6 @@ async def run_backfill(
         cycle_start = cycle_end - timedelta(hours=4)
         cycles_to_simulate.append((cycle_start, cycle_end))
     cycles_to_simulate.reverse()
-
-    total_tweets = 0
-    pause_count = 0
-    max_tweets = 9000 if days >= 10 else 4500
-    max_pauses = 3
 
     try:
         for idx, (cycle_start, cycle_end) in enumerate(cycles_to_simulate):
@@ -346,7 +352,7 @@ async def run_backfill(
         log.info(
             "backfill_done",
             extra={
-                "days_arg": days,
+                "backfill_days": days,
                 "tweets_total": total_tweets,
                 "duration_min": round(duration, 2),
                 "cycles_total": len(cycles_to_simulate),
@@ -357,7 +363,7 @@ async def run_backfill(
         log.exception(
             "backfill_failed",
             extra={
-                "days_arg": days,
+                "backfill_days": days,
                 "tweets_total": total_tweets,
                 "cycles_done": locals().get("idx", 0),
             },

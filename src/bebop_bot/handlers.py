@@ -91,9 +91,9 @@ HELP_TEXT = (
     "/seed_viral_example add &lt;json&gt; — append a viral seed\n"
     "\n"
     "<b>Backfill</b>\n"
-    "/backfill — historical sweep to seed baselines (default 14d)\n"
+    "/backfill — historical sweep to seed baselines (default 7d)\n"
     "/backfill --force — re-run within the 30-day cooldown\n"
-    "/backfill --days N — override the window (1..30)\n"
+    "/backfill --days N — override the window (1..7)\n"
     "\n"
     "<b>Meta</b>\n"
     "/help — this message\n"
@@ -363,7 +363,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         conn, "convergence_strong_claude_min", "4",
     )
     backfill_last = await dbm.get_setting(conn, "last_backfill_at", None)
-    backfill_days = await dbm.get_setting(conn, "backfill_days", "14")
+    backfill_days = await dbm.get_setting(conn, "backfill_days", "7")
     last_run_at = await dbm.get_setting(conn, "last_run_at", None)
     last_manual_run_at = await dbm.get_setting(conn, "last_manual_run_at", None)
 
