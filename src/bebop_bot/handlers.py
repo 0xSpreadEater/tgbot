@@ -320,28 +320,94 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply(update, f"Threshold set to {formatted}.")
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _format_iso_age(iso: str | None) -> str:
+    if not iso:
+        return "never"
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+    except ValueError:
+        return iso
+    age = (datetime.now(UTC) - dt).total_seconds()
+    return f"{dt.isoformat()} ({_format_duration(age)} ago)"
+
+
 @restricted
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    import time as _time
+
+    from bebop_bot import scheduler as scheduler_mod
+
     conn = _conn(context)
+    db = _db_wrapper(context)
     paused = await dbm.get_setting(conn, "paused", "0")
     threshold = await dbm.get_setting(conn, "threshold", "2")
+    emerging_threshold = await dbm.get_setting(
+        conn, "emerging_entity_threshold", "1.5",
+    )
     evm_on = await dbm.get_setting(conn, "chain_evm_enabled", "1")
     sol_on = await dbm.get_setting(conn, "chain_solana_enabled", "1")
     conv_weak = await dbm.get_setting(conn, "convergence_weak_threshold", "2")
     conv_medium = await dbm.get_setting(conn, "convergence_medium_threshold", "3")
-    strong_on = await dbm.get_setting(conn, "strong_convergence_enabled", "1")
     strong_threshold = await dbm.get_setting(
         conn, "convergence_strong_claude_min", "4",
     )
+    backfill_last = await dbm.get_setting(conn, "last_backfill_at", None)
+    backfill_days = await dbm.get_setting(conn, "backfill_days", "14")
+    last_run_at = await dbm.get_setting(conn, "last_run_at", None)
+
     topics_count = await dbm.count_rows(conn, "topics")
     allow_count = await dbm.count_rows(conn, "allowlist")
+    author_scores_count = await dbm.count_rows(conn, "author_scores")
+
+    sector_total = await dbm.count_rows(conn, "sector_dictionary")
+    venue_total = await dbm.count_rows(conn, "venue_dictionary")
     mech_total = await dbm.count_rows(conn, "mechanism_dictionary")
+
+    async def _proposed_count(table: str) -> int:
+        async with conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE source = 'claude_proposed'"
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["n"]) if row else 0
+
+    sector_proposed = await _proposed_count("sector_dictionary")
+    venue_proposed = await _proposed_count("venue_dictionary")
+    mech_proposed = await _proposed_count("mechanism_dictionary")
+
+    calib_total = await dbm.count_rows(conn, "viral_seed_examples")
     async with conn.execute(
-        "SELECT COUNT(*) AS n FROM mechanism_dictionary WHERE source = 'claude_proposed'"
+        "SELECT COUNT(*) AS n FROM viral_seed_examples WHERE source = 'user_added'"
     ) as cur:
         row = await cur.fetchone()
-    mech_proposed = int(row["n"]) if row else 0
-    viral_seeds_count = await dbm.count_rows(conn, "viral_seed_examples")
+    calib_user_added = int(row["n"]) if row else 0
+
+    patterns_total = await dbm.count_rows(conn, "claude_proposed_patterns")
+    async with conn.execute(
+        "SELECT "
+        "SUM(CASE WHEN user_label='up' THEN 1 ELSE 0 END) AS ups, "
+        "SUM(CASE WHEN user_label='down' THEN 1 ELSE 0 END) AS downs "
+        "FROM claude_proposed_patterns"
+    ) as cur:
+        row = await cur.fetchone()
+    pattern_ups = int(row["ups"] or 0) if row else 0
+    pattern_downs = int(row["downs"] or 0) if row else 0
+
     settings = context.application.bot_data["settings"]
     db_path = settings.db_path
     try:
@@ -349,21 +415,52 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         size_str = _humanize_bytes(size)
     except OSError:
         size_str = "unknown"
+
+    scheduler = context.application.bot_data.get("scheduler")
+    next_dt = scheduler_mod.next_run_at(scheduler) if scheduler is not None else None
+    if next_dt is not None:
+        delta = (next_dt - datetime.now(UTC)).total_seconds()
+        sched_line = (
+            f"running, next run in {_format_duration(delta)}"
+        )
+    else:
+        sched_line = "not running"
+
+    started = context.application.bot_data.get("process_started_at")
+    uptime_line = _format_duration(_time.time() - started) if started else "unknown"
+
+    last_run_line = _format_iso_age(last_run_at)
+    if backfill_last:
+        backfill_line = f"yes ({_format_iso_age(backfill_last)}, {backfill_days}d window)"
+    else:
+        backfill_line = "no"
+
+    # Pull just for the count line.
+    _ = db
+
     text = (
         "<b>Bebop bot status</b>\n"
         f"Paused: {'yes' if paused == '1' else 'no'}\n"
         f"Topics: {topics_count}\n"
         f"Allowlist: {allow_count}\n"
-        f"Threshold: {threshold}\n"
+        f"Author scores tracked: {author_scores_count}\n"
+        f"Sectors tracked: {sector_total} ({sector_proposed} proposed)\n"
+        f"Venues tracked: {venue_total} ({venue_proposed} proposed)\n"
+        f"Mechanisms tracked: {mech_total} ({mech_proposed} proposed)\n"
+        f"Calibration examples: {calib_total} ({calib_user_added} user-added)\n"
+        f"Claude-proposed patterns: {patterns_total} "
+        f"({pattern_ups} up-voted, {pattern_downs} hidden)\n"
+        f"Threshold: {threshold} (post insight)\n"
+        f"Emerging threshold: {emerging_threshold} (entity composite)\n"
+        f"Convergence: weak {conv_weak}/7, medium {conv_medium}/7, "
+        f"strong {strong_threshold}/5\n"
         f"Chains: EVM={'on' if evm_on == '1' else 'off'}, "
         f"Solana={'on' if sol_on == '1' else 'off'}\n"
-        f"Mechanisms tracked: {mech_total} ({mech_proposed} proposed)\n"
-        f"Convergence thresholds: weak={conv_weak}/7, medium={conv_medium}/7\n"
-        f"Strong convergence: {'on' if strong_on == '1' else 'off'} "
-        f"(threshold {strong_threshold}/5)\n"
-        f"Viral seed examples: {viral_seeds_count}\n"
-        "Scheduler: not yet implemented\n"
-        f"DB path: {html.escape(db_path)}, size: {size_str}"
+        f"Backfilled: {backfill_line}\n"
+        f"Scheduler: {sched_line}\n"
+        f"Last run: {last_run_line}\n"
+        f"DB size: {size_str}\n"
+        f"Process uptime: {uptime_line}"
     )
     await _reply(update, text, parse_mode=ParseMode.HTML)
 
@@ -1645,7 +1742,24 @@ async def on_convergence_callback(
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("handler_error", exc_info=context.error)
+    log.error(
+        "handler_error",
+        extra={
+            "error": str(context.error),
+            "trace": "".join(
+                __import__("traceback").format_exception(context.error)
+            ) if context.error else "",
+        },
+    )
+    try:
+        if isinstance(update, Update) and update.effective_message is not None:
+            await update.effective_message.reply_text(
+                "Something went wrong - check logs."
+            )
+        elif isinstance(update, Update) and update.callback_query is not None:
+            await update.callback_query.answer("Something went wrong - check logs.")
+    except Exception:  # noqa: BLE001
+        log.exception("handler_error_reply_failed")
 
 
 def register_handlers(app: Application) -> None:

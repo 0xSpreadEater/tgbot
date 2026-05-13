@@ -373,6 +373,33 @@ async def collect_venue_suggestions(
 async def run_emerging(
     db: Any, x: Any, claude: Any, bot: Any, chat_id: int,
 ) -> dict:
+    """Public entry point. Top-level try/except so a failure inside the
+    emerging track does NOT kill the surrounding pipeline cycle."""
+    try:
+        return await _run_emerging_inner(db, x, claude, bot, chat_id)
+    except Exception:  # noqa: BLE001
+        log.exception("run_emerging_failed")
+        return {
+            "cycle_ts": datetime.now(UTC),
+            "tokens": [],
+            "sectors": [],
+            "venues": [],
+            "mechanisms": [],
+            "convergence_events": [],
+            "convergence_strong": [],
+            "convergence_medium": [],
+            "convergence_weak": [],
+            "new_dict_terms": [],
+            "venue_suggestions": [],
+            "cooc_graph": {},
+            "sweep_pool": [],
+            "pattern_proposals": [],
+        }
+
+
+async def _run_emerging_inner(
+    db: Any, x: Any, claude: Any, bot: Any, chat_id: int,
+) -> dict:
     cycle_ts = datetime.now(UTC)
     threshold = float(await db.get_setting("emerging_entity_threshold", "1.5") or 1.5)
     allowlist = await db.get_allowlist()

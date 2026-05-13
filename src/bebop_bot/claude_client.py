@@ -79,7 +79,8 @@ class ClaudeClient:
 
     def __init__(self, api_key: str, model: str):
         self.model = model
-        self._client = AsyncAnthropic(api_key=api_key)
+        # SDK default-retries on 408/409/429/5xx (including 529). Bump to 3.
+        self._client = AsyncAnthropic(api_key=api_key, max_retries=3)
 
     async def close(self) -> None:
         # AsyncAnthropic uses httpx under the hood; close its session.

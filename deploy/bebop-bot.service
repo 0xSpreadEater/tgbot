@@ -1,0 +1,19 @@
+[Unit]
+Description=Bebop X-roundup bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bebop
+Group=bebop
+WorkingDirectory=/home/bebop/tgbot
+EnvironmentFile=/etc/bebop-bot.env
+ExecStart=/home/bebop/.local/bin/uv run python -m bebop_bot
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
