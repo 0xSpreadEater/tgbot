@@ -104,8 +104,30 @@ async def propose_patterns(
 
     Returns the list of proposals (with `is_new` set for rows that were
     inserted vs bumped) for digest rendering. Persistence side-effects
-    happen as a side effect of this call.
+    happen as a side effect of this call. Wrapped in a top-level
+    try/except so a single failing call doesn't kill the cycle.
     """
+    try:
+        return await _propose_patterns_inner(
+            db=db, claude=claude, cycle_ts=cycle_ts, sweep_pool=sweep_pool,
+            all_entities=all_entities, sector_dict=sector_dict,
+            venue_dict=venue_dict, mechanism_dict=mechanism_dict,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("propose_patterns_top_level_failed")
+        return []
+
+
+async def _propose_patterns_inner(
+    db: Any,
+    claude: Any,
+    cycle_ts: datetime,
+    sweep_pool: list[Any],
+    all_entities: list[tuple[str, str]],
+    sector_dict: list[dict] | None = None,
+    venue_dict: list[dict] | None = None,
+    mechanism_dict: list[dict] | None = None,
+) -> list[dict]:
     if claude is None or not sweep_pool:
         return []
     try:

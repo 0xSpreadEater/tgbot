@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.27",
     "anthropic>=0.40",
     "tenacity>=8.2",
+    "apscheduler>=3.10",
 ]
 
 [project.optional-dependencies]
@@ -42,3 +43,6 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.poe.tasks]
+check-log-extras = "python tools/check_log_extras.py"

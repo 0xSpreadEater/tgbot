@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import time
 
 from dotenv import load_dotenv
 from telegram.ext import AIORateLimiter, Application
@@ -10,6 +11,7 @@ from bebop_bot.config import get_settings
 from bebop_bot.db import Db, init_db
 from bebop_bot.handlers import register_handlers
 from bebop_bot.logging_setup import setup_logging
+from bebop_bot.scheduler import start_scheduler
 from bebop_bot.x_client import XClient
 
 log = logging.getLogger(__name__)
@@ -31,7 +33,9 @@ async def main() -> None:
     )
     app.bot_data["settings"] = settings
     app.bot_data["db"] = conn
-    app.bot_data["db_wrapper"] = Db(conn)
+    db_wrapper = Db(conn)
+    app.bot_data["db_wrapper"] = db_wrapper
+    app.bot_data["process_started_at"] = time.time()
 
     x_client: XClient | None = None
     claude_client: ClaudeClient | None = None
@@ -48,17 +52,29 @@ async def main() -> None:
 
     register_handlers(app)
 
+    scheduler = None
     log.info("bot_ready")
     try:
-        # run_polling is async-aware; use the underscore variant to avoid
-        # nested event-loop management when we're already in asyncio.run().
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
+        # Start scheduler AFTER PTB is up so the running loop is bound
+        # and bot.send_message is usable from scheduled jobs.
+        scheduler = start_scheduler(
+            db=db_wrapper,
+            x=x_client,
+            claude=claude_client,
+            bot=app.bot,
+            chat_id=settings.telegram_user_id,
+        )
+        app.bot_data["scheduler"] = scheduler
         # Block forever until cancelled.
         stop_event = asyncio.Event()
         await stop_event.wait()
     finally:
+        if scheduler is not None:
+            with contextlib.suppress(Exception):
+                scheduler.shutdown(wait=False)
         with contextlib.suppress(Exception):
             await app.updater.stop()
         with contextlib.suppress(Exception):
