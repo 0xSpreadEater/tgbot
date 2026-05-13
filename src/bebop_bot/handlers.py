@@ -7,6 +7,7 @@ import re
 from datetime import UTC, date, datetime, timedelta
 
 import aiosqlite
+from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -24,8 +25,6 @@ from bebop_bot.feedback import (
 )
 from bebop_bot.query_parser import normalize
 
-RATE_LIMIT_SECONDS = 60 * 60
-
 log = logging.getLogger(__name__)
 
 HELP_TEXT = (
@@ -40,11 +39,9 @@ HELP_TEXT = (
     "/test &lt;query&gt; — fetch 5 most recent (no scoring, no save)\n"
     "\n"
     "<b>Roundup</b>\n"
-    "/scan — manual scan of emerging coins and trends ONLY (no topic "
-    "roundup, no rate limit, ignores /pause)\n"
-    "/run — full manual scan including topics (60-min rate limit, "
-    "respects /pause)\n"
-    "/pause — stop scheduled cycles (Phase 5)\n"
+    "/run — manual full scan, resets the 4h schedule\n"
+    "/scan — manual force scan (emerging-only, ignores /pause)\n"
+    "/pause — stop scheduled cycles\n"
     "/resume — resume scheduled cycles\n"
     "/status — bot health\n"
     "\n"
@@ -351,8 +348,6 @@ def _format_iso_age(iso: str | None) -> str:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     import time as _time
 
-    from bebop_bot import scheduler as scheduler_mod
-
     conn = _conn(context)
     db = _db_wrapper(context)
     paused = await dbm.get_setting(conn, "paused", "0")
@@ -370,6 +365,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     backfill_last = await dbm.get_setting(conn, "last_backfill_at", None)
     backfill_days = await dbm.get_setting(conn, "backfill_days", "14")
     last_run_at = await dbm.get_setting(conn, "last_run_at", None)
+    last_manual_run_at = await dbm.get_setting(conn, "last_manual_run_at", None)
 
     topics_count = await dbm.count_rows(conn, "topics")
     allow_count = await dbm.count_rows(conn, "allowlist")
@@ -417,11 +413,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         size_str = "unknown"
 
     scheduler = context.application.bot_data.get("scheduler")
-    next_dt = scheduler_mod.next_run_at(scheduler) if scheduler is not None else None
+    next_dt: datetime | None = None
+    if scheduler is not None:
+        try:
+            job = scheduler.get_job("full_cycle")
+        except Exception:  # noqa: BLE001
+            job = None
+        if job is not None:
+            next_dt = job.next_run_time
     if next_dt is not None:
         delta = (next_dt - datetime.now(UTC)).total_seconds()
         sched_line = (
-            f"running, next run in {_format_duration(delta)}"
+            f"running, next scheduled run: {next_dt.isoformat()} "
+            f"({_format_duration(delta)} from now)"
         )
     else:
         sched_line = "not running"
@@ -430,6 +434,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uptime_line = _format_duration(_time.time() - started) if started else "unknown"
 
     last_run_line = _format_iso_age(last_run_at)
+    last_manual_run_line = _format_iso_age(last_manual_run_at)
     if backfill_last:
         backfill_line = f"yes ({_format_iso_age(backfill_last)}, {backfill_days}d window)"
     else:
@@ -459,6 +464,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Backfilled: {backfill_line}\n"
         f"Scheduler: {sched_line}\n"
         f"Last run: {last_run_line}\n"
+        f"Last manual run: {last_manual_run_line}\n"
         f"DB size: {size_str}\n"
         f"Process uptime: {uptime_line}"
     )
@@ -486,29 +492,6 @@ def _db_wrapper(context: ContextTypes.DEFAULT_TYPE) -> dbm.Db:
     return db
 
 
-async def _check_and_set_rate_limit(db: dbm.Db) -> int | None:
-    """Return remaining seconds if rate-limited, otherwise None and stamp now."""
-    last = await db.get_setting("last_manual_run_at")
-    now = datetime.now(UTC)
-    if last:
-        try:
-            last_dt = datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=UTC)
-            elapsed = (now - last_dt).total_seconds()
-            if elapsed < RATE_LIMIT_SECONDS:
-                return int(RATE_LIMIT_SECONDS - elapsed)
-        except ValueError:
-            pass
-    await db.set_setting("last_manual_run_at", now.isoformat())
-    return None
-
-
-def _format_rate_limit_remaining(seconds: int) -> str:
-    m, s = divmod(max(0, seconds), 60)
-    return f"Next /run available in {m}m {s}s."
-
-
 async def _ensure_pipeline_clients(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> tuple[object, object, dbm.Db] | None:
@@ -526,22 +509,49 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if clients is None:
         return
     x_client, claude_client, db = clients
-    remaining = await _check_and_set_rate_limit(db)
-    if remaining is not None:
-        await _reply(update, _format_rate_limit_remaining(remaining))
-        return
     settings = context.application.bot_data["settings"]
-    await _reply(update, "Running roundup…")
-    await pipelinem.run_roundup(
-        db=db,
-        x=x_client,
-        claude=claude_client,
-        bot=context.bot,
-        chat_id=settings.telegram_user_id,
-        advance_since_id=True,
-        force=False,
-        manual_scan=False,
+
+    now = datetime.now(UTC)
+    next_run = now + timedelta(hours=4)
+    new_hours = ",".join(
+        str((next_run.hour + 4 * i) % 24) for i in range(6)
     )
+    scheduler = context.application.bot_data.get("scheduler")
+    if scheduler is not None:
+        try:
+            scheduler.reschedule_job(
+                job_id="full_cycle",
+                trigger=CronTrigger(
+                    hour=new_hours,
+                    minute=next_run.minute,
+                    second=0,
+                    timezone="UTC",
+                ),
+            )
+            log.info(
+                "manual_run_reset_cron",
+                extra={
+                    "next_run_iso": next_run.isoformat(),
+                    "new_hours_pattern": new_hours,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("manual_run_reschedule_failed")
+
+    await _reply(update, "Running roundup. Next scheduled cycle in 4 hours.")
+    try:
+        await pipelinem.run_roundup(
+            db=db,
+            x=x_client,
+            claude=claude_client,
+            bot=context.bot,
+            chat_id=settings.telegram_user_id,
+            advance_since_id=True,
+            force=False,
+            manual_scan=False,
+        )
+    finally:
+        await db.set_setting("last_manual_run_at", now.isoformat())
 
 
 @restricted
