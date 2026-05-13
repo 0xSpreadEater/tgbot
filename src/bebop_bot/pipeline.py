@@ -5,6 +5,7 @@ from typing import Any
 
 from bebop_bot import digest
 from bebop_bot import emerging as emerging_mod
+from bebop_bot import patterns as patterns_mod
 from bebop_bot.filter import filter_topic
 from bebop_bot.models import ScoredTweet
 
@@ -108,6 +109,15 @@ async def run_roundup(
             bot, chat_id, results, db=db, manual_scan=manual_scan,
             emerging=emerging_result,
         )
+        # Pattern of the week: only on full cycles (not /scan). Silent
+        # when there's no clear weekly winner.
+        if not manual_scan:
+            try:
+                await patterns_mod.maybe_send_pattern_of_the_week(
+                    bot=bot, chat_id=chat_id, db=db,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("pattern_of_week_pipeline_failed")
         await db.set_setting("last_run_at", datetime.now(UTC).isoformat())
         log.info(
             "roundup_done",

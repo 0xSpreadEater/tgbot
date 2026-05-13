@@ -365,9 +365,14 @@ async def detect_convergence_tier(
     venue_dict: list[dict],
     mechanism_dict: list[dict],
     viral_seeds: list[dict],
+    pattern_corpus: list[dict] | None = None,
 ) -> dict:
     """Tier 2: ask Claude to judge whether the pattern resembles known
-    viral precursors. Returns dict with claude_confidence and rationale."""
+    viral precursors. Returns dict with claude_confidence and rationale.
+
+    pattern_corpus, when supplied, is the Claude-proposed pattern corpus
+    (Phase 4.7); the judge sees it as additional few-shot context.
+    """
     sample = _representative_tweets(
         entity_type, entity_term, sweep_pool, sector_dict, venue_dict, mechanism_dict,
     )
@@ -379,7 +384,25 @@ async def detect_convergence_tier(
             evidence=evidence,
             viral_seeds=viral_seeds,
             sample_tweets=sample,
+            pattern_corpus=pattern_corpus or [],
         )
+    except TypeError:
+        # Fallback for older clients without pattern_corpus kwarg.
+        try:
+            judgment = await claude.judge_strong_convergence(
+                entity_type=entity_type,
+                entity_term=entity_term,
+                signals_fired=list(evidence.keys()),
+                evidence=evidence,
+                viral_seeds=viral_seeds,
+                sample_tweets=sample,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "judge_strong_convergence_failed",
+                extra={"entity_type": entity_type, "entity_term": entity_term},
+            )
+            judgment = {"confidence": None, "rationale": None}
     except Exception:  # noqa: BLE001
         log.exception(
             "judge_strong_convergence_failed",
@@ -402,7 +425,14 @@ def build_convergence_summary(
 ) -> str:
     fired = result.get("signals", [])
     body = ", ".join(fired) or "no signals"
-    label = "STRONG" if tier == "strong_convergence" else "convergence"
+    label_map = {
+        "strong": "STRONG",
+        "strong_convergence": "STRONG",
+        "medium": "convergence",
+        "convergence": "convergence",
+        "weak": "weak",
+    }
+    label = label_map.get(tier, "convergence")
     summary = f"{label}: {entity_type}:{entity_term} fired {len(fired)}/7 signals ({body})."
     if claude_rationale:
         summary += f" Claude: {claude_rationale}"

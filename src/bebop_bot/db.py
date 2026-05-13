@@ -288,6 +288,146 @@ async def apply_calibration_source_migration(conn: aiosqlite.Connection) -> None
         log.info("calibration_source_migration_applied")
 
 
+PHASE_4_7_NEW_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("convergence_weak_threshold", "2"),
+    ("convergence_medium_threshold", "3"),
+    ("convergence_strong_claude_min", "4"),
+    ("convergence_weak_cap_per_cycle", "15"),
+    ("convergence_medium_cap_per_cycle", "10"),
+    ("convergence_strong_cap_per_cycle", "5"),
+    ("pattern_proposals_per_cycle", "3"),
+    ("pattern_few_shot_limit", "15"),
+    ("pattern_of_the_week_lookback_days", "7"),
+)
+
+
+async def apply_phase_4_7_migrations(conn: aiosqlite.Connection) -> None:
+    """Phase 4.7: three-tier convergence + Claude-proposed patterns.
+
+    Idempotent. Safe to re-run. Migrates legacy tier names on
+    convergence_events ('convergence' -> 'medium', 'strong_convergence'
+    -> 'strong').
+    """
+    # Migrate legacy tier names on convergence_events.
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS n FROM convergence_events WHERE tier = ?",
+        ("convergence",),
+    )
+    row = await cur.fetchone()
+    legacy_medium = int(row["n"]) if row else 0
+    if legacy_medium > 0:
+        await conn.execute(
+            "UPDATE convergence_events SET tier = 'medium' WHERE tier = 'convergence'"
+        )
+        log.info(
+            "phase_4_7_tier_migrated_medium",
+            extra={"migrated_count": legacy_medium},
+        )
+
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS n FROM convergence_events WHERE tier = ?",
+        ("strong_convergence",),
+    )
+    row = await cur.fetchone()
+    legacy_strong = int(row["n"]) if row else 0
+    if legacy_strong > 0:
+        await conn.execute(
+            "UPDATE convergence_events SET tier = 'strong' "
+            "WHERE tier = 'strong_convergence'"
+        )
+        log.info(
+            "phase_4_7_tier_migrated_strong",
+            extra={"migrated_count": legacy_strong},
+        )
+
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS claude_proposed_patterns(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL,
+            first_proposed_at TIMESTAMP NOT NULL,
+            last_proposed_at TIMESTAMP NOT NULL,
+            propose_count INTEGER NOT NULL DEFAULT 1,
+            user_label TEXT,
+            user_label_at TIMESTAMP,
+            weight REAL NOT NULL DEFAULT 1.0
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_patterns_last_proposed "
+        "ON claude_proposed_patterns(last_proposed_at DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_patterns_weight "
+        "ON claude_proposed_patterns(weight DESC)"
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pattern_observations(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_id INTEGER NOT NULL,
+            cycle_ts TIMESTAMP NOT NULL,
+            confidence INTEGER NOT NULL,
+            supporting_tweet_ids_json TEXT,
+            anchor_entities_json TEXT,
+            FOREIGN KEY (pattern_id)
+                REFERENCES claude_proposed_patterns(id) ON DELETE CASCADE
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pattern_obs_cycle "
+        "ON pattern_observations(cycle_ts DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pattern_obs_pattern "
+        "ON pattern_observations(pattern_id, cycle_ts DESC)"
+    )
+
+    for key, value in PHASE_4_7_NEW_SETTINGS:
+        await conn.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+
+    # If the legacy Phase-4 keys were customized, map them onto the new
+    # keys only when the new keys are still at the defaults.
+    legacy_medium_thr = None
+    async with conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        ("convergence_signal_threshold",),
+    ) as cur:
+        row = await cur.fetchone()
+        if row:
+            legacy_medium_thr = row["value"]
+    if legacy_medium_thr is not None:
+        await conn.execute(
+            "UPDATE settings SET value = ? "
+            "WHERE key = 'convergence_medium_threshold' AND value = '3'",
+            (legacy_medium_thr,),
+        )
+
+    legacy_strong_min = None
+    async with conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        ("strong_convergence_claude_threshold",),
+    ) as cur:
+        row = await cur.fetchone()
+        if row:
+            legacy_strong_min = row["value"]
+    if legacy_strong_min is not None:
+        await conn.execute(
+            "UPDATE settings SET value = ? "
+            "WHERE key = 'convergence_strong_claude_min' AND value = '4'",
+            (legacy_strong_min,),
+        )
+
+    await conn.commit()
+    log.info("phase_4_7_migration_applied")
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     from bebop_bot.seed import seed_all
 
@@ -296,6 +436,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await apply_schema(conn)
     await apply_phase4_migration(conn)
     await apply_calibration_source_migration(conn)
+    await apply_phase_4_7_migrations(conn)
     await seed_all(conn)
     log.info("db_init_done", extra={"db_path": db_path})
     return conn
@@ -1025,6 +1166,230 @@ class Db:
 
     async def commit(self) -> None:
         await self.conn.commit()
+
+    # -----------------------------------------------------------------
+    # Phase 4.7: Claude-proposed patterns
+    # -----------------------------------------------------------------
+
+    async def find_pattern_by_name(self, name: str) -> int | None:
+        """Case-insensitive lookup. Returns pattern id or None."""
+        async with self.conn.execute(
+            "SELECT id FROM claude_proposed_patterns WHERE LOWER(name) = LOWER(?)",
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["id"]) if row else None
+
+    async def get_pattern_by_name(self, name: str) -> dict | None:
+        async with self.conn.execute(
+            "SELECT id, name, description, first_proposed_at, last_proposed_at, "
+            "propose_count, user_label, user_label_at, weight "
+            "FROM claude_proposed_patterns WHERE LOWER(name) = LOWER(?)",
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_pattern_by_id(self, pattern_id: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT id, name, description, first_proposed_at, last_proposed_at, "
+            "propose_count, user_label, user_label_at, weight "
+            "FROM claude_proposed_patterns WHERE id = ?",
+            (int(pattern_id),),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def insert_pattern(
+        self,
+        *,
+        name: str,
+        description: str,
+        cycle_ts: datetime,
+        confidence: int,
+        supporting_tweet_ids: list[str],
+        anchor_entities: list[tuple[str, str]],
+    ) -> int:
+        ts = cycle_ts.isoformat() if isinstance(cycle_ts, datetime) else cycle_ts
+        cur = await self.conn.execute(
+            "INSERT INTO claude_proposed_patterns("
+            "name, description, first_proposed_at, last_proposed_at, "
+            "propose_count, weight) "
+            "VALUES(?, ?, ?, ?, 1, 1.0)",
+            (name, description, ts, ts),
+        )
+        pattern_id = int(cur.lastrowid or 0)
+        await self.conn.execute(
+            "INSERT INTO pattern_observations("
+            "pattern_id, cycle_ts, confidence, supporting_tweet_ids_json, "
+            "anchor_entities_json) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (
+                pattern_id, ts, int(confidence),
+                json.dumps(list(supporting_tweet_ids or [])),
+                json.dumps([list(a) for a in (anchor_entities or [])]),
+            ),
+        )
+        await self.conn.commit()
+        return pattern_id
+
+    async def bump_pattern(
+        self,
+        pattern_id: int,
+        cycle_ts: datetime,
+        *,
+        confidence: int,
+        supporting_tweet_ids: list[str],
+        anchor_entities: list[tuple[str, str]],
+    ) -> None:
+        ts = cycle_ts.isoformat() if isinstance(cycle_ts, datetime) else cycle_ts
+        await self.conn.execute(
+            "UPDATE claude_proposed_patterns "
+            "SET propose_count = propose_count + 1, "
+            "last_proposed_at = ? "
+            "WHERE id = ?",
+            (ts, int(pattern_id)),
+        )
+        await self.conn.execute(
+            "INSERT INTO pattern_observations("
+            "pattern_id, cycle_ts, confidence, supporting_tweet_ids_json, "
+            "anchor_entities_json) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (
+                int(pattern_id), ts, int(confidence),
+                json.dumps(list(supporting_tweet_ids or [])),
+                json.dumps([list(a) for a in (anchor_entities or [])]),
+            ),
+        )
+        await self.conn.commit()
+
+    async def get_patterns_active(
+        self, *, exclude_down: bool = True, limit: int = 50,
+    ) -> list[dict]:
+        sql = (
+            "SELECT id, name, description, first_proposed_at, last_proposed_at, "
+            "propose_count, user_label, user_label_at, weight "
+            "FROM claude_proposed_patterns "
+        )
+        if exclude_down:
+            sql += "WHERE (user_label IS NULL OR user_label != 'down') "
+        sql += "ORDER BY weight DESC, propose_count DESC, last_proposed_at DESC LIMIT ?"
+        rows = await fetch_all(self.conn, sql, (int(limit),))
+        return [dict(r) for r in rows]
+
+    async def get_patterns_for_few_shot(self, limit: int = 15) -> list[dict]:
+        """Patterns to inject as few-shot for the strong-tier judge. Excludes
+        any pattern the user explicitly labelled 'down'."""
+        return await self.get_patterns_active(exclude_down=True, limit=int(limit))
+
+    async def get_patterns_hidden(self, limit: int = 100) -> list[dict]:
+        rows = await fetch_all(
+            self.conn,
+            "SELECT id, name, description, first_proposed_at, last_proposed_at, "
+            "propose_count, user_label, user_label_at, weight "
+            "FROM claude_proposed_patterns WHERE user_label = 'down' "
+            "ORDER BY last_proposed_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        return [dict(r) for r in rows]
+
+    async def update_pattern_label(self, pattern_id: int, label: str | None) -> None:
+        now_iso = datetime.utcnow().isoformat()
+        await self.conn.execute(
+            "UPDATE claude_proposed_patterns "
+            "SET user_label = ?, user_label_at = ? WHERE id = ?",
+            (label, now_iso if label is not None else None, int(pattern_id)),
+        )
+        await self.conn.commit()
+
+    async def set_pattern_weight(self, pattern_id: int, weight: float) -> None:
+        await self.conn.execute(
+            "UPDATE claude_proposed_patterns SET weight = ? WHERE id = ?",
+            (float(weight), int(pattern_id)),
+        )
+        await self.conn.commit()
+
+    async def get_pattern_observations(
+        self, pattern_id: int, limit: int = 20,
+    ) -> list[dict]:
+        rows = await fetch_all(
+            self.conn,
+            "SELECT id, pattern_id, cycle_ts, confidence, "
+            "supporting_tweet_ids_json, anchor_entities_json "
+            "FROM pattern_observations WHERE pattern_id = ? "
+            "ORDER BY cycle_ts DESC LIMIT ?",
+            (int(pattern_id), int(limit)),
+        )
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["supporting_tweet_ids"] = json.loads(
+                    d.get("supporting_tweet_ids_json") or "[]"
+                )
+            except (json.JSONDecodeError, TypeError):
+                d["supporting_tweet_ids"] = []
+            try:
+                d["anchor_entities"] = [
+                    tuple(a) for a in json.loads(
+                        d.get("anchor_entities_json") or "[]"
+                    )
+                ]
+            except (json.JSONDecodeError, TypeError):
+                d["anchor_entities"] = []
+            out.append(d)
+        return out
+
+    async def pattern_of_week_winner(self, lookback_days: int) -> dict | None:
+        """Return the pattern with the most observations in the lookback
+        window IF it beats the runner-up by >= 2. Otherwise None."""
+        days_clause = f"-{int(lookback_days)} days"
+        rows = await fetch_all(
+            self.conn,
+            "SELECT p.id, p.name, p.description, p.weight, "
+            "COUNT(o.id) AS recent_propose_count "
+            "FROM claude_proposed_patterns p "
+            "JOIN pattern_observations o ON o.pattern_id = p.id "
+            "WHERE o.cycle_ts >= datetime('now', ?) "
+            "AND (p.user_label IS NULL OR p.user_label != 'down') "
+            "GROUP BY p.id, p.name, p.description, p.weight "
+            "ORDER BY recent_propose_count DESC LIMIT 2",
+            (days_clause,),
+        )
+        rows = [dict(r) for r in rows]
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return rows[0]
+        winner, runnerup = rows[0], rows[1]
+        if int(winner["recent_propose_count"]) - int(
+            runnerup["recent_propose_count"]
+        ) < 2:
+            return None
+        return winner
+
+    async def housekeep_patterns(self) -> dict[str, int]:
+        """Auto-bump organically-persistent patterns; age out stale ones.
+
+        Returns a dict with the counts of bumped/deleted rows.
+        """
+        cur = await self.conn.execute(
+            "UPDATE claude_proposed_patterns "
+            "SET weight = 1.5 "
+            "WHERE user_label IS NULL "
+            "AND weight = 1.0 "
+            "AND propose_count >= 3 "
+            "AND last_proposed_at >= datetime('now', '-14 days')"
+        )
+        bumped = cur.rowcount or 0
+        cur = await self.conn.execute(
+            "DELETE FROM claude_proposed_patterns "
+            "WHERE last_proposed_at < datetime('now', '-30 days') "
+            "AND (user_label IS NULL OR user_label = 'down')"
+        )
+        deleted = cur.rowcount or 0
+        await self.conn.commit()
+        return {"bumped": int(bumped), "deleted": int(deleted)}
 
     async def bottom_authors_by_downs(
         self, days: int = 60, limit: int = 10

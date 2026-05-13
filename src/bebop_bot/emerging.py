@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from bebop_bot import convergence, cooccurrence, dictionary, extractors
+from bebop_bot import convergence, cooccurrence, dictionary, extractors, patterns
 from bebop_bot.scoring import EntityScore, compute_entity_score
 
 log = logging.getLogger(__name__)
@@ -417,21 +417,58 @@ async def run_emerging(
             cycle_ts, threshold, cooc_graph,
         )
 
-    # Step 7: convergence (deterministic + Claude tier)
-    conv_threshold = int(await db.get_setting("convergence_signal_threshold", "3") or 3)
-    strong_enabled = await db.get_setting_bool("strong_convergence_enabled", True)
-    strong_threshold = int(
-        await db.get_setting("strong_convergence_claude_threshold", "4") or 4
+    # Step 6.5: Pattern proposal. Runs after structural emerging detection
+    # (so we have the co-occurrence map) but BEFORE the strong-tier
+    # judge — proposals feed into the judge's pattern_corpus few-shot.
+    all_entity_keys: list[tuple[str, str]] = (
+        [("token", t.token) for t in tokens_results]
+        + [(e.entity_type, e.term) for e in sectors_results + venues_results + mechanisms_results]
     )
+    pattern_proposals: list[dict] = []
+    try:
+        pattern_proposals = await patterns.propose_patterns(
+            db=db,
+            claude=claude,
+            cycle_ts=cycle_ts,
+            sweep_pool=sweep_pool,
+            all_entities=all_entity_keys,
+            sector_dict=sector_dict,
+            venue_dict=venue_dict,
+            mechanism_dict=mechanism_dict,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("pattern_proposal_failed")
+
+    # Step 7: three-tier convergence (weak / medium / strong).
+    weak_thr = int(await db.get_setting("convergence_weak_threshold", "2") or 2)
+    med_thr = int(await db.get_setting("convergence_medium_threshold", "3") or 3)
+    strong_min_conf = int(
+        await db.get_setting("convergence_strong_claude_min", "4") or 4
+    )
+    weak_cap = int(await db.get_setting("convergence_weak_cap_per_cycle", "15") or 15)
+    med_cap = int(await db.get_setting("convergence_medium_cap_per_cycle", "10") or 10)
+    strong_cap = int(
+        await db.get_setting("convergence_strong_cap_per_cycle", "5") or 5
+    )
+    strong_enabled = await db.get_setting_bool("strong_convergence_enabled", True)
     viral_seeds = await db.get_viral_seed_examples()
+    try:
+        pattern_corpus = await db.get_patterns_for_few_shot(
+            limit=int(await db.get_setting("pattern_few_shot_limit", "15") or 15),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("pattern_corpus_fetch_failed")
+        pattern_corpus = []
 
     top_tweet_by_entity: dict[tuple[str, str], str | None] = {}
+    composite_by_entity: dict[tuple[str, str], float] = {}
     for t in tokens_results:
         top_tweet_by_entity[("token", t.token)] = t.top_tweet_url
+        composite_by_entity[("token", t.token)] = t.score.composite
     for e in sectors_results + venues_results + mechanisms_results:
         top_tweet_by_entity[(e.entity_type, e.term)] = e.top_tweet_url
+        composite_by_entity[(e.entity_type, e.term)] = e.score.composite
 
-    convergence_events: list[dict] = []
     candidate_entities: list[tuple[str, str]] = (
         [("token", t.token) for t in tokens_results[:10]]
         + [("sector", e.term) for e in sectors_results[:10]]
@@ -439,6 +476,8 @@ async def run_emerging(
         + [("mechanism", e.term) for e in mechanisms_results[:10]]
     )
 
+    weak_candidates: list[dict] = []
+    medium_candidates: list[dict] = []
     for ent_type, ent_term in candidate_entities:
         partners = cooc_graph.get((ent_type, ent_term), [])
         result = await convergence.detect_convergence_for_entity(
@@ -450,56 +489,171 @@ async def run_emerging(
             mechanism_dict=mechanism_dict,
             cycle_ts=cycle_ts,
         )
-        if result["count"] < conv_threshold:
+        n_cats = int(result.get("count", 0))
+        if n_cats < weak_thr:
             continue
+        bucket = "medium" if n_cats >= med_thr else "weak"
+        candidate = {
+            "type": ent_type,
+            "term": ent_term,
+            "signal_count": n_cats,
+            "signals": list(result.get("signals", [])),
+            "evidence": dict(result.get("evidence", {})),
+            "composite": float(composite_by_entity.get((ent_type, ent_term), 0.0)),
+            "top_tweet_url": top_tweet_by_entity.get((ent_type, ent_term)),
+            "co_occurs_with": [
+                (pt, pterm) for (pt, pterm, _w) in partners[:6]
+            ],
+        }
+        if bucket == "medium":
+            medium_candidates.append(candidate)
+        else:
+            weak_candidates.append(candidate)
 
-        tier = "convergence"
-        claude_confidence = None
-        claude_rationale = None
-        if strong_enabled and claude is not None:
-            strong = await convergence.detect_convergence_tier(
-                db=db, claude=claude,
-                entity_type=ent_type, entity_term=ent_term,
-                signal_count=result["count"], evidence=result["evidence"],
-                sweep_pool=sweep_pool,
-                sector_dict=sector_dict, venue_dict=venue_dict,
-                mechanism_dict=mechanism_dict,
-                viral_seeds=viral_seeds,
-            )
-            claude_confidence = strong.get("claude_confidence")
-            claude_rationale = strong.get("claude_rationale")
-            if (
-                claude_confidence is not None
-                and isinstance(claude_confidence, int)
-                and claude_confidence >= strong_threshold
-            ):
-                tier = "strong_convergence"
+    weak_candidates.sort(key=lambda c: c["composite"], reverse=True)
+    medium_candidates.sort(key=lambda c: c["composite"], reverse=True)
+    weak_candidates = weak_candidates[:weak_cap]
+    medium_candidates = medium_candidates[:med_cap]
 
+    # Persist weak + medium tier rows up-front so the digest and any later
+    # tier upgrade share the same convergence_events row count.
+    weak_events: list[dict] = []
+    medium_events: list[dict] = []
+    medium_event_ids_by_key: dict[tuple[str, str], int] = {}
+
+    async def _persist_event(
+        candidate: dict, tier: str, conf: int | None, rationale: str | None,
+    ) -> int | None:
         summary = convergence.build_convergence_summary(
-            ent_type, ent_term, result, tier, claude_rationale,
+            candidate["type"], candidate["term"],
+            {"signals": candidate["signals"], "count": candidate["signal_count"]},
+            tier, rationale,
         )
+        candidate["summary"] = summary
         try:
-            await db.insert_convergence_event(
+            return await db.insert_convergence_event(
                 cycle_ts=cycle_ts,
-                entity_type=ent_type, entity_term=ent_term,
-                tier=tier, signal_count=result["count"],
-                claude_confidence=claude_confidence,
-                claude_rationale=claude_rationale,
+                entity_type=candidate["type"], entity_term=candidate["term"],
+                tier=tier, signal_count=candidate["signal_count"],
+                claude_confidence=conf,
+                claude_rationale=rationale,
                 summary=summary,
             )
         except Exception:  # noqa: BLE001
             log.exception(
                 "convergence_event_insert_failed",
-                extra={"entity_type": ent_type, "entity_term": ent_term},
+                extra={
+                    "entity_type": candidate["type"],
+                    "entity_term": candidate["term"],
+                    "tier_name": tier,
+                },
             )
-        convergence_events.append({
-            "type": ent_type, "term": ent_term, "tier": tier,
-            "signal_count": result["count"],
-            "claude_confidence": claude_confidence,
-            "claude_rationale": claude_rationale,
-            "summary": summary,
-            "top_tweet_url": top_tweet_by_entity.get((ent_type, ent_term)),
+            return None
+
+    for cand in weak_candidates:
+        await _persist_event(cand, "weak", None, None)
+        weak_events.append({
+            "type": cand["type"], "term": cand["term"], "tier": "weak",
+            "signal_count": cand["signal_count"],
+            "claude_confidence": None,
+            "claude_rationale": None,
+            "summary": cand.get("summary", ""),
+            "top_tweet_url": cand.get("top_tweet_url"),
+            "co_occurs_with": cand.get("co_occurs_with", []),
+            "signals": cand.get("signals", []),
         })
+
+    for cand in medium_candidates:
+        event_id = await _persist_event(cand, "medium", None, None)
+        if event_id:
+            medium_event_ids_by_key[(cand["type"], cand["term"])] = event_id
+        medium_events.append({
+            "type": cand["type"], "term": cand["term"], "tier": "medium",
+            "signal_count": cand["signal_count"],
+            "claude_confidence": None,
+            "claude_rationale": None,
+            "summary": cand.get("summary", ""),
+            "top_tweet_url": cand.get("top_tweet_url"),
+            "co_occurs_with": cand.get("co_occurs_with", []),
+            "signals": cand.get("signals", []),
+        })
+
+    # Strong tier: candidates are the top-K mediums; Claude judges them.
+    strong_events: list[dict] = []
+    if strong_enabled and claude is not None and medium_candidates:
+        for cand in medium_candidates[:strong_cap]:
+            try:
+                strong = await convergence.detect_convergence_tier(
+                    db=db, claude=claude,
+                    entity_type=cand["type"], entity_term=cand["term"],
+                    signal_count=cand["signal_count"],
+                    evidence=cand["evidence"],
+                    sweep_pool=sweep_pool,
+                    sector_dict=sector_dict, venue_dict=venue_dict,
+                    mechanism_dict=mechanism_dict,
+                    viral_seeds=viral_seeds,
+                    pattern_corpus=pattern_corpus,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "strong_judge_failed",
+                    extra={
+                        "entity_type": cand["type"],
+                        "entity_term": cand["term"],
+                    },
+                )
+                continue
+            claude_confidence = strong.get("claude_confidence")
+            claude_rationale = strong.get("claude_rationale")
+            if (
+                isinstance(claude_confidence, int)
+                and claude_confidence >= strong_min_conf
+            ):
+                key = (cand["type"], cand["term"])
+                event_id = medium_event_ids_by_key.get(key)
+                summary = convergence.build_convergence_summary(
+                    cand["type"], cand["term"],
+                    {"signals": cand["signals"], "count": cand["signal_count"]},
+                    "strong", claude_rationale,
+                )
+                if event_id is not None:
+                    try:
+                        await db.conn.execute(
+                            "UPDATE convergence_events SET tier = 'strong', "
+                            "claude_confidence = ?, claude_rationale = ?, "
+                            "summary = ? WHERE id = ?",
+                            (
+                                int(claude_confidence), claude_rationale,
+                                summary, int(event_id),
+                            ),
+                        )
+                        await db.conn.commit()
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "convergence_event_strong_update_failed",
+                            extra={
+                                "entity_type": cand["type"],
+                                "entity_term": cand["term"],
+                            },
+                        )
+                strong_events.append({
+                    "type": cand["type"], "term": cand["term"],
+                    "tier": "strong",
+                    "signal_count": cand["signal_count"],
+                    "claude_confidence": claude_confidence,
+                    "claude_rationale": claude_rationale,
+                    "summary": summary,
+                    "top_tweet_url": cand.get("top_tweet_url"),
+                    "co_occurs_with": cand.get("co_occurs_with", []),
+                    "signals": cand.get("signals", []),
+                })
+                # Remove the row from medium_events list (tier upgraded).
+                medium_events = [
+                    e for e in medium_events
+                    if (e["type"], e["term"]) != key
+                ]
+
+    convergence_events: list[dict] = strong_events + medium_events + weak_events
 
     # Step 8: propose new dict terms via Claude
     new_dict_terms: list[tuple[str, str]] = []
@@ -517,6 +671,13 @@ async def run_emerging(
         db, venues_results, cycle_ts,
     )
 
+    # Step 10: pattern housekeeping (auto-bump organically-persistent;
+    # age out stale unlabelled patterns).
+    try:
+        await patterns.housekeep_patterns(db)
+    except Exception:  # noqa: BLE001
+        log.exception("pattern_housekeep_failed")
+
     log.info(
         "emerging_done",
         extra={
@@ -525,6 +686,9 @@ async def run_emerging(
             "n_venues": len(venues_results),
             "n_mechanisms": len(mechanisms_results),
             "n_convergence": len(convergence_events),
+            "n_strong": len(strong_events),
+            "n_medium": len(medium_events),
+            "n_weak": len(weak_events),
             "n_new_dict_terms": len(new_dict_terms),
             "n_venue_suggestions": len(venue_suggestions),
         },
@@ -537,7 +701,12 @@ async def run_emerging(
         "venues": venues_results,
         "mechanisms": mechanisms_results,
         "convergence_events": convergence_events,
+        "convergence_strong": strong_events,
+        "convergence_medium": medium_events,
+        "convergence_weak": weak_events,
         "new_dict_terms": new_dict_terms,
         "venue_suggestions": venue_suggestions,
         "cooc_graph": cooc_graph,
+        "sweep_pool": sweep_pool,
+        "pattern_proposals": pattern_proposals,
     }

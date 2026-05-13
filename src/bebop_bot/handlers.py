@@ -69,9 +69,10 @@ HELP_TEXT = (
     "<b>Emerging</b>\n"
     "/emerging — show last cycle's emerging entities\n"
     "/convergence — show last cycle's convergence events\n"
-    "/convergence_threshold &lt;n&gt; — set deterministic signal floor\n"
+    "/convergence_threshold [weak|medium &lt;n&gt;] — set tier floors\n"
     "/strong_convergence on|off — toggle Claude tier\n"
     "/strong_threshold &lt;n&gt; — set Claude confidence floor\n"
+    "/patterns — list / curate Claude-proposed patterns\n"
     "/dismiss — (coming soon)\n"
     "/chains — (coming soon)\n"
     "/sol_config — (coming soon)\n"
@@ -326,9 +327,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     threshold = await dbm.get_setting(conn, "threshold", "2")
     evm_on = await dbm.get_setting(conn, "chain_evm_enabled", "1")
     sol_on = await dbm.get_setting(conn, "chain_solana_enabled", "1")
-    conv_threshold = await dbm.get_setting(conn, "convergence_signal_threshold", "3")
+    conv_weak = await dbm.get_setting(conn, "convergence_weak_threshold", "2")
+    conv_medium = await dbm.get_setting(conn, "convergence_medium_threshold", "3")
     strong_on = await dbm.get_setting(conn, "strong_convergence_enabled", "1")
-    strong_threshold = await dbm.get_setting(conn, "strong_convergence_claude_threshold", "4")
+    strong_threshold = await dbm.get_setting(
+        conn, "convergence_strong_claude_min", "4",
+    )
     topics_count = await dbm.count_rows(conn, "topics")
     allow_count = await dbm.count_rows(conn, "allowlist")
     mech_total = await dbm.count_rows(conn, "mechanism_dictionary")
@@ -354,7 +358,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Chains: EVM={'on' if evm_on == '1' else 'off'}, "
         f"Solana={'on' if sol_on == '1' else 'off'}\n"
         f"Mechanisms tracked: {mech_total} ({mech_proposed} proposed)\n"
-        f"Convergence signal threshold: {conv_threshold}/7\n"
+        f"Convergence thresholds: weak={conv_weak}/7, medium={conv_medium}/7\n"
         f"Strong convergence: {'on' if strong_on == '1' else 'off'} "
         f"(threshold {strong_threshold}/5)\n"
         f"Viral seed examples: {viral_seeds_count}\n"
@@ -786,8 +790,12 @@ async def cmd_convergence(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, "No convergence events in the most recent cycle.")
         return
     ts = events[0]["cycle_ts"]
-    strong = [e for e in events if e["tier"] == "strong_convergence"]
-    normal = [e for e in events if e["tier"] == "convergence"]
+    strong = [e for e in events if e["tier"] in ("strong", "strong_convergence")]
+    medium = [
+        e for e in events
+        if e["tier"] in ("medium", "convergence", "structural")
+    ]
+    weak = [e for e in events if e["tier"] == "weak"]
     lines = [f"<b>Convergence — cycle {html.escape(str(ts))}</b>"]
     lines.append(f"STRONG ({len(strong)}):")
     for e in strong:
@@ -800,8 +808,15 @@ async def cmd_convergence(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         if e.get("summary"):
             lines.append(f"    {html.escape(e['summary'])[:300]}")
-    lines.append(f"NORMAL ({len(normal)}):")
-    for e in normal:
+    lines.append(f"MEDIUM ({len(medium)}):")
+    for e in medium:
+        lines.append(
+            f"  - {html.escape(e['entity_type'])}: "
+            f"{html.escape(e['entity_term'])} "
+            f"({e['signal_count']}/7 sigs)"
+        )
+    lines.append(f"WEAK ({len(weak)}):")
+    for e in weak:
         lines.append(
             f"  - {html.escape(e['entity_type'])}: "
             f"{html.escape(e['entity_term'])} "
@@ -814,23 +829,90 @@ async def cmd_convergence(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_convergence_threshold(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """Three-tier (Phase 4.7) convergence threshold control.
+
+    Usage:
+      /convergence_threshold                — show current weak+medium
+      /convergence_threshold weak <n>       — set weak floor   (1..7)
+      /convergence_threshold medium <n>     — set medium floor (1..7)
+      /convergence_threshold <n>            — legacy: sets the medium floor
+
+    Validation: medium must remain strictly greater than weak.
+    """
     args = context.args or []
-    if not args:
-        db = _db_wrapper(context)
-        cur = await db.get_setting("convergence_signal_threshold", "3")
-        await _reply(update, f"Convergence signal threshold: {cur}/7")
-        return
-    try:
-        n = int(args[0])
-    except ValueError:
-        await _reply(update, "Threshold must be an integer 1..7.")
-        return
-    if not 1 <= n <= 7:
-        await _reply(update, "Threshold must be between 1 and 7.")
-        return
     db = _db_wrapper(context)
-    await db.set_setting("convergence_signal_threshold", str(n))
-    await _reply(update, f"Convergence signal threshold set to {n}/7.")
+    if not args:
+        weak = await db.get_setting("convergence_weak_threshold", "2")
+        med = await db.get_setting("convergence_medium_threshold", "3")
+        await _reply(
+            update,
+            f"Convergence thresholds: weak={weak}/7, medium={med}/7.",
+        )
+        return
+
+    first = args[0].lower()
+    # Legacy: a single integer maps to the medium threshold.
+    if first.isdigit() or (first.startswith("-") and first[1:].isdigit()):
+        try:
+            n = int(first)
+        except ValueError:
+            await _reply(update, "Threshold must be an integer 1..7.")
+            return
+        if not 1 <= n <= 7:
+            await _reply(update, "Threshold must be between 1 and 7.")
+            return
+        weak = int(await db.get_setting("convergence_weak_threshold", "2") or 2)
+        if n <= weak:
+            await _reply(
+                update,
+                f"Rejected: medium threshold must be greater than weak "
+                f"(currently weak={weak}).",
+            )
+            return
+        await db.set_setting("convergence_medium_threshold", str(n))
+        # Phase 4 alias, kept up-to-date for backwards compat.
+        await db.set_setting("convergence_signal_threshold", str(n))
+        await _reply(update, f"Medium convergence threshold set to {n}/7.")
+        return
+
+    if first in ("weak", "medium") and len(args) >= 2:
+        try:
+            n = int(args[1])
+        except ValueError:
+            await _reply(update, "Threshold must be an integer 1..7.")
+            return
+        if not 1 <= n <= 7:
+            await _reply(update, "Threshold must be between 1 and 7.")
+            return
+        if first == "weak":
+            med = int(await db.get_setting("convergence_medium_threshold", "3") or 3)
+            if n >= med:
+                await _reply(
+                    update,
+                    f"Rejected: weak threshold must be less than medium "
+                    f"(currently medium={med}).",
+                )
+                return
+            await db.set_setting("convergence_weak_threshold", str(n))
+            await _reply(update, f"Weak convergence threshold set to {n}/7.")
+        else:
+            weak = int(await db.get_setting("convergence_weak_threshold", "2") or 2)
+            if n <= weak:
+                await _reply(
+                    update,
+                    f"Rejected: medium threshold must be greater than weak "
+                    f"(currently weak={weak}).",
+                )
+                return
+            await db.set_setting("convergence_medium_threshold", str(n))
+            await db.set_setting("convergence_signal_threshold", str(n))
+            await _reply(update, f"Medium convergence threshold set to {n}/7.")
+        return
+
+    await _reply(
+        update,
+        "Usage: /convergence_threshold [weak|medium <n>] (1..7)",
+    )
 
 
 @restricted
@@ -854,10 +936,15 @@ async def cmd_strong_convergence(
 async def cmd_strong_threshold(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """Phase 4.7: thin alias over convergence_strong_claude_min.
+
+    Updates both the Phase 4 key and the new Phase 4.7 key so older
+    callers keep reading the right value.
+    """
     args = context.args or []
+    db = _db_wrapper(context)
     if not args:
-        db = _db_wrapper(context)
-        cur = await db.get_setting("strong_convergence_claude_threshold", "4")
+        cur = await db.get_setting("convergence_strong_claude_min", "4")
         await _reply(update, f"Strong convergence Claude threshold: {cur}/5")
         return
     try:
@@ -868,7 +955,7 @@ async def cmd_strong_threshold(
     if not 1 <= n <= 5:
         await _reply(update, "Threshold must be between 1 and 5.")
         return
-    db = _db_wrapper(context)
+    await db.set_setting("convergence_strong_claude_min", str(n))
     await db.set_setting("strong_convergence_claude_threshold", str(n))
     await _reply(update, f"Strong convergence Claude threshold set to {n}/5.")
 
@@ -1315,6 +1402,248 @@ async def _cmd_calibration_remove(
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 4.7: Claude-proposed pattern commands & callbacks
+# ---------------------------------------------------------------------------
+
+
+_PATTERNS_USAGE = (
+    "<b>/patterns</b> — manage Claude-proposed patterns\n\n"
+    "/patterns — list active patterns (excludes hidden)\n"
+    "/patterns down — list hidden patterns\n"
+    "/patterns show &lt;name&gt; — full details + supporting tweets\n"
+    "/patterns up &lt;name&gt; — up-vote (weight 2.0)\n"
+    "/patterns down &lt;name&gt; — hide from future prompts\n"
+    "/patterns unhide &lt;name&gt; — restore a hidden pattern"
+)
+
+
+def _format_pattern_summary_line(p: dict) -> str:
+    name = html.escape(str(p.get("name") or ""))
+    desc = html.escape(str(p.get("description") or ""))
+    weight = float(p.get("weight", 1.0) or 1.0)
+    pc = int(p.get("propose_count", 0) or 0)
+    label = p.get("user_label")
+    tag = ""
+    if label == "up":
+        tag = " [up]"
+    elif label == "down":
+        tag = " [hidden]"
+    elif weight >= 1.5 and not label:
+        tag = " [auto-bumped]"
+    return (
+        f"<b>{name}</b> (weight {weight:.1f}, proposed {pc}x){tag}\n"
+        f"<i>{desc}</i>"
+    )
+
+
+@restricted
+async def cmd_patterns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    db = _db_wrapper(context)
+    if not args:
+        rows = await db.get_patterns_active(exclude_down=True, limit=200)
+        if not rows:
+            await _reply(
+                update,
+                "No Claude-proposed patterns yet. They show up after a cycle "
+                "with /scan or /run.",
+            )
+            return
+        n_total = len(rows)
+        n_up = sum(1 for r in rows if r.get("user_label") == "up")
+        n_bumped = sum(
+            1 for r in rows
+            if not r.get("user_label") and float(r.get("weight", 1.0) or 1.0) >= 1.5
+        )
+        lines = [
+            f"<b>Active patterns</b> ({n_total} total, {n_up} up-voted, "
+            f"{n_bumped} naturally-bumped)",
+            "",
+        ]
+        for r in rows[:50]:
+            lines.append(_format_pattern_summary_line(r))
+            lines.append("")
+        lines.append("<i>Use /patterns show NAME for full details.</i>")
+        await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    sub = args[0].lower()
+    rest = " ".join(args[1:]).strip()
+    if sub == "down" and not rest:
+        rows = await db.get_patterns_hidden(limit=200)
+        if not rows:
+            await _reply(update, "No hidden patterns.")
+            return
+        lines = [f"<b>Hidden patterns</b> ({len(rows)})", ""]
+        for r in rows:
+            lines.append(_format_pattern_summary_line(r))
+            lines.append("")
+        await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if not rest:
+        await _reply(update, _PATTERNS_USAGE, parse_mode=ParseMode.HTML)
+        return
+
+    name = rest
+    pattern = await db.get_pattern_by_name(name)
+    if not pattern:
+        await _reply(
+            update,
+            f"No pattern named '{html.escape(name)}'. Use /patterns to list "
+            "active ones.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if sub == "show":
+        observations = await db.get_pattern_observations(int(pattern["id"]))
+        from bebop_bot.patterns import format_pattern_detail
+        body = format_pattern_detail(pattern, observations)
+        await _reply(update, body, parse_mode=ParseMode.HTML)
+        return
+    if sub == "up":
+        await db.update_pattern_label(int(pattern["id"]), "up")
+        await db.set_pattern_weight(int(pattern["id"]), 2.0)
+        await _reply(
+            update,
+            f"Up-voted '{html.escape(pattern['name'])}'. Weight 2.0.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if sub == "down":
+        await db.update_pattern_label(int(pattern["id"]), "down")
+        await _reply(
+            update,
+            f"Hidden '{html.escape(pattern['name'])}'. Claude won't see "
+            "it in future few-shot context.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if sub == "unhide":
+        await db.update_pattern_label(int(pattern["id"]), None)
+        await db.set_pattern_weight(int(pattern["id"]), 1.0)
+        await _reply(
+            update,
+            f"Unhid '{html.escape(pattern['name'])}'. Weight reset to 1.0.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _reply(update, _PATTERNS_USAGE, parse_mode=ParseMode.HTML)
+
+
+async def on_pattern_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    data = query.data
+    if not data.startswith("pat:"):
+        return
+    parts = data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("Malformed pattern action.")
+        return
+    action, name = parts[1], parts[2]
+    db = _db_wrapper(context)
+    pattern = await db.get_pattern_by_name(name)
+    if pattern is None:
+        await query.answer("Pattern not found (may have aged out).")
+        return
+
+    if action == "up":
+        await db.update_pattern_label(int(pattern["id"]), "up")
+        await db.set_pattern_weight(int(pattern["id"]), 2.0)
+        await query.answer(
+            "Kept. This pattern will rank higher in future Claude prompts.",
+        )
+        try:
+            if query.message is not None:
+                await query.message.reply_text(
+                    f"👍 keeping pattern '{pattern['name']}' (weight 2.0)",
+                )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "pattern_callback_followup_failed",
+                extra={"pattern_name": pattern["name"], "action_name": action},
+            )
+        return
+
+    if action == "down":
+        await db.update_pattern_label(int(pattern["id"]), "down")
+        await query.answer(
+            "Hidden. Claude won't see this in future prompts.",
+        )
+        try:
+            if query.message is not None:
+                await query.message.reply_text(
+                    f"👎 hidden pattern '{pattern['name']}'",
+                )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "pattern_callback_followup_failed",
+                extra={"pattern_name": pattern["name"], "action_name": action},
+            )
+        return
+
+    if action == "show":
+        observations = await db.get_pattern_observations(int(pattern["id"]))
+        from bebop_bot.patterns import format_pattern_detail
+        body = format_pattern_detail(pattern, observations)
+        await query.answer()
+        try:
+            if query.message is not None:
+                await query.message.reply_text(
+                    body, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "pattern_show_followup_failed",
+                extra={"pattern_name": pattern["name"]},
+            )
+        return
+
+    await query.answer("Unknown pattern action.")
+
+
+async def on_convergence_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Convergence-event keyboard callback (cv:<tier>:<etype>:<eterm>:<action>).
+
+    Legacy 'cv:structural:*' is treated as 'cv:medium:*' so older Telegram
+    history keeps working. Convergence callbacks currently just acknowledge
+    the user's vote — they don't yet write into a separate feedback table.
+    """
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    data = query.data
+    if not data.startswith("cv:"):
+        return
+    parts = data.split(":", 4)
+    if len(parts) < 2:
+        await query.answer("Malformed convergence action.")
+        return
+    tier = parts[1]
+    if tier == "structural":
+        tier = "medium"
+    if tier not in ("weak", "medium", "strong"):
+        await query.answer("Unknown convergence tier.")
+        return
+    action = parts[4] if len(parts) >= 5 else ""
+    if action == "up":
+        await query.answer("Marked as insight.")
+    elif action == "down":
+        await query.answer("Marked as noise.")
+    else:
+        await query.answer("Recorded.")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("handler_error", exc_info=context.error)
 
@@ -1359,8 +1688,11 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("seed_viral_example", cmd_seed_viral_example))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
     app.add_handler(CommandHandler("calibration", cmd_calibration_root))
+    app.add_handler(CommandHandler("patterns", cmd_patterns))
     app.add_handler(CallbackQueryHandler(on_venue_suggestion_callback, pattern=r"^s_v:"))
     app.add_handler(CallbackQueryHandler(on_suggestion_callback, pattern=r"^s:"))
+    app.add_handler(CallbackQueryHandler(on_pattern_callback, pattern=r"^pat:"))
+    app.add_handler(CallbackQueryHandler(on_convergence_callback, pattern=r"^cv:"))
     app.add_handler(CallbackQueryHandler(on_feedback_callback, pattern=r"^[udm]:"))
     for name in COMING_SOON_COMMANDS:
         app.add_handler(CommandHandler(name, _make_coming_soon(name)))
